@@ -2544,6 +2544,7 @@ Only questions that need a decision by the product owner are listed. Engineering
 | Q7 | A read-only member role? | Not in v1. |
 | Q8 | Encrypt the extension's plaintext export file, for example under a one-time passphrase? | Plaintext with a warning. |
 | Q9 | A continuous "volgen" mode in Teamwerk that keeps following a colleague's navigation? | One-shot "Volg" only. |
+| Q10 | Share an AI provider key with a profile, so every member can use the AI features on the owner's account? The key would be a record encrypted under the profile key like any other, so the server never sees it, but every member's device can read it and every call is billed to the key's owner. It also needs owner-only writes for that namespace, which records do not have yet (8.1, 9.4). | Proposed by the owner (2026-10-29); not in v1 until decided. Default once built: off per profile, switched on by an owner, with the members and the risk shown before it is shared. |
 
 ---
 
