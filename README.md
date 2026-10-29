@@ -2,7 +2,7 @@
 
 A small, self-hostable, end-to-end encrypted sync server for [EB Sessions](https://github.com/SherinBloemendaal/eboekhouden-extension), the Chrome extension for e-Boekhouden.
 
-> Status: in development. The protocol is being specified and reviewed; there is no code to deploy yet.
+> Status: in development. The protocol is specified in [docs/SPEC.md](docs/SPEC.md) (draft, independently reviewed once). There is no code to deploy yet.
 
 ## What it will do
 
