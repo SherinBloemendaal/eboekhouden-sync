@@ -37,7 +37,7 @@ The key words MUST, MUST NOT, SHOULD, SHOULD NOT and MAY are used as in RFC 2119
 
 ### 1.1 What this is
 
-EB Sessions is a Chrome MV3 extension that enhances the Dutch bookkeeping web app e-Boekhouden. Several of its features keep small pieces of state: import groups, hidden bank lines, AI classifications per bank line, the reminder ladder mapping, and per-screen preferences. Today this state lives in `chrome.storage.local` on one machine. EB Sessions Sync lets that state follow the user to other devices and lets colleagues who work in the same e-Boekhouden administration share it.
+EB Sessions is a Chrome MV3 extension that enhances the Dutch bookkeeping web app e-Boekhouden. Several of its features keep small pieces of state: import groups, hidden bank lines, AI classifications per bank line, the reminder ladder mapping, and per-screen preferences. Today this state lives in `chrome.storage.local` on one machine. EB Sessions Sync lets that state follow the user to other devices and lets colleagues who work in the same e-Boekhouden administration share it. Per-screen preferences are the exception: they are personal and stay local on each device (8.1).
 
 ### 1.2 Goals
 
@@ -85,7 +85,7 @@ The dashboard is a static single-page app served by the same Worker, on the same
 
 ### 1.5 Design summary in one paragraph
 
-Each profile has a random 256-bit data key (DK) and a random 256-bit naming key (NK). Each device has a non-extractable ECDH P-256 key and a non-extractable ECDSA P-256 key, kept in IndexedDB of the extension origin. DK and NK are wrapped per device with ephemeral-static ECDH, HKDF-SHA-256 and AES-256-GCM, and every wrap is signed by the device that made it. Records are AES-256-GCM encrypted with a random 96-bit nonce and associated data that binds profile id, record id, key version, record version and the delete flag. Record ids are HMAC-SHA-256 of the logical name under a key derived from NK. A hash-chained membership log, signed entry by entry by member devices, is the source of truth for who holds the keys. A new device or user gets access only after an existing member device approves it, ideally after comparing a 100-bit device code. Removing a device or user appends a removal and a key rotation; any remaining member re-encrypts old records lazily in rate-limited batches. A printed recovery key (128 bits, PBKDF2-SHA-256 600,000 iterations) protects a per-user recovery pseudo-device so that a single user who loses all devices can recover.
+Each profile has, per key version, a random 256-bit data key (DK) and a random 256-bit naming key (NK); both rotate together. Each device has a non-extractable ECDH P-256 key and a non-extractable ECDSA P-256 key, kept in IndexedDB of the extension origin. DK and NK are wrapped per device with ephemeral-static ECDH, HKDF-SHA-256 and AES-256-GCM, and every wrap is signed by the device that made it. Records are AES-256-GCM encrypted with a random 96-bit nonce and associated data that binds profile id, record id, key version, record version and the delete flag. Record ids are HMAC-SHA-256 of the logical name under a key derived from NK, so every record gets a new id at each rotation. A hash-chained membership log, signed entry by entry by member devices, is the source of truth for who holds the keys. A new device or user gets access only after an existing member device approves it, ideally after comparing a 100-bit device code. Removing a device or user appends a removal and a key rotation; any remaining member re-encrypts and renames old records lazily in rate-limited batches. A printed recovery key (128 bits, PBKDF2-SHA-256 600,000 iterations) protects a per-user recovery pseudo-device so that a single user who loses all devices can recover.
 
 ---
 
@@ -110,12 +110,12 @@ Each profile has a random 256-bit data key (DK) and a random 256-bit naming key 
 | Grant | Server-side authorization for a user to access a profile. Created by an admin or the profile owner. Starts as `pending` until a member device approves it cryptographically. |
 | Approval | The client action that wraps DK and NK for a pending device and appends a signed `add_device` log entry. |
 | DK | Data key of a profile, 32 random bytes, versioned by `kv`. |
-| NK | Naming key of a profile, 32 random bytes, never rotated in v1. |
+| NK | Naming key of a profile, 32 random bytes per key version (`NK_kv`), rotated together with DK. Derives record ids, display name keys and Teamwerk row references. |
 | kv | Key version, integer starting at 1. Incremented by every rotation. |
 | Wrap | DK and NK of one key version, encrypted for one device. |
 | Record | One encrypted JSON value stored under an opaque record id within a profile. |
 | Logical key | The plaintext name the extension uses for a record, for example `hiddenLines/8812345`. |
-| Record id (rid) | `HMAC(K_rid, logical key)`, opaque to the server. |
+| Record id (rid) | `HMAC(K_rid(kv), logical key)`, opaque to the server; changes at each rotation. |
 | Tombstone | A record with `deleted = true`. Its ciphertext is an encrypted tombstone payload. |
 | Cursor | Opaque string returned by the server; marks how far a client has pulled a profile's changes. |
 | seq | Server-assigned, strictly increasing change counter per profile. The cursor encodes it. |
@@ -237,20 +237,20 @@ Every wrap, log body and recovery blob carries `"v": 1`. The suite is fixed per 
       v
  PER PROFILE, PER KEY VERSION kv
  ===============================
- Wrap(kv, device) = AES-GCM(KEK, NK || DK_kv), signed by the wrapping device
+ Wrap(kv, device) = AES-GCM(KEK, NK_kv || DK_kv), signed by the wrapping device
 
-     NK (32 B, constant per profile)            DK_kv (32 B, rotated on removal)
+     NK_kv (32 B, rotated with DK)              DK_kv (32 B, rotated on removal)
        |                                          |
-       | HKDF info "ebs/v1/rid"                   +-- HKDF "ebs/v1/rec"    -> K_rec(kv)    AES-GCM: records
-       v                                          +-- HKDF "ebs/v1/meta"   -> K_meta(kv)   AES-GCM: profile meta
-     K_rid  HMAC: record id = HMAC(K_rid, key)    +-- HKDF "ebs/v1/hist"   -> K_hist(kv)   AES-GCM: DK_(kv-1)
-       |                                          +-- HKDF "ebs/v1/commit" -> K_commit(kv) HMAC: dk_commit(kv)
-       +-- HKDF "ebs/v1/nk-commit" -> nk_commit
+       +-- HKDF "ebs/v1/rid"  -> K_rid(kv)        +-- HKDF "ebs/v1/rec"    -> K_rec(kv)    AES-GCM: records
+       |     HMAC: record id = HMAC(K_rid, key)   +-- HKDF "ebs/v1/meta"   -> K_meta(kv)   AES-GCM: profile meta
+       +-- HKDF "ebs/v1/name" -> K_name(kv)       +-- HKDF "ebs/v1/hist"   -> K_hist(kv)   AES-GCM: NK_(kv-1) || DK_(kv-1)
+       +-- HKDF "ebs/v1/focus" -> K_focus(kv)     +-- HKDF "ebs/v1/commit" -> K_commit(kv) HMAC: dk_commit(kv)
+       +-- HKDF "ebs/v1/nk-commit" -> nk_commit(kv)
                                                    History chain (server-stored):
-                                                   DK_n --K_hist(n)--> DK_(n-1) --K_hist(n-1)--> ... --> DK_1
+                                                   (NK,DK)_n --K_hist(n)--> (NK,DK)_(n-1) --> ... --> (NK,DK)_1
 ```
 
-A device that holds a wrap for the current `kv` can reach every older DK through the history chain, so a device that joins after a rotation needs only one wrap. A removed device never receives `DK_(kv+1)` and cannot walk the chain forward.
+A device that holds a wrap for the current `kv` can reach every older NK and DK through the history chain, so a device that joins after a rotation needs only one wrap. A removed device never receives `NK_(kv+1)` or `DK_(kv+1)` and cannot walk the chain forward.
 
 ### 5.2 Derivations
 
@@ -263,20 +263,20 @@ For profile id `p` (UTF-8 string) and key version `kv`:
 | `K_hist(kv)` | `HKDF(DK_kv, Z32, enc("ebs/v1/hist", p, u32(kv)))` | AES-GCM |
 | `K_commit(kv)` | `HKDF(DK_kv, Z32, enc("ebs/v1/commit", p, u32(kv)))` | HMAC-SHA-256 |
 | `dk_commit(kv)` | `b64u(HMAC(K_commit(kv), enc("ebs/v1/dk-commit", p, u32(kv))))` | value in the log |
-| `K_rid` | `HKDF(NK, Z32, enc("ebs/v1/rid", p))` | HMAC-SHA-256 |
-| `rid(name)` | `b64u(HMAC(K_rid, utf8(name)))` | record id |
-| `K_nkc` | `HKDF(NK, Z32, enc("ebs/v1/nk-commit", p))` | HMAC-SHA-256 |
-| `nk_commit` | `b64u(HMAC(K_nkc, enc("ebs/v1/nk-commit", p)))` | value in the genesis entry |
-| `K_name` | `HKDF(NK, Z32, enc("ebs/v1/name", p))` | AES-GCM, display names in the log (9.3) |
+| `K_rid(kv)` | `HKDF(NK_kv, Z32, enc("ebs/v1/rid", p))` | HMAC-SHA-256 |
+| `rid_kv(name)` | `b64u(HMAC(K_rid(kv), utf8(name)))` | record id of a logical key at key version `kv` |
+| `K_nkc(kv)` | `HKDF(NK_kv, Z32, enc("ebs/v1/nk-commit", p))` | HMAC-SHA-256 |
+| `nk_commit(kv)` | `b64u(HMAC(K_nkc(kv), enc("ebs/v1/nk-commit", p, u32(kv))))` | value in the log (genesis for kv 1, `rotate_key` after that) |
+| `K_name(kv)` | `HKDF(NK_kv, Z32, enc("ebs/v1/name", p))` | AES-GCM, display names in the log (9.3) |
 | `K_pres(kv)`, `K_sess`, `K_focus` | see 18.6 | Teamwerk only |
 
-In WebCrypto: import `DK_kv` (or `NK`) with `importKey("raw", bytes, "HKDF", false, ["deriveKey", "deriveBits"])`, then `deriveKey({name: "HKDF", hash: "SHA-256", salt, info}, base, {name: "AES-GCM", length: 256} or {name: "HMAC", hash: "SHA-256", length: 256}, false, usages)`. Derived keys are non-extractable.
+In WebCrypto: import `DK_kv` (or `NK_kv`) with `importKey("raw", bytes, "HKDF", false, ["deriveKey", "deriveBits"])`, then `deriveKey({name: "HKDF", hash: "SHA-256", salt, info}, base, {name: "AES-GCM", length: 256} or {name: "HMAC", hash: "SHA-256", length: 256}, false, usages)`. Derived keys are non-extractable.
 
 `dk_commit` and `nk_commit` let every member verify that the DK and NK it unwrapped are the ones the signed log declares, so a malicious member or server cannot hand different devices different keys for the same version without detection.
 
 ### 5.3 Wrap format
 
-A wrap carries `NK || DK_kv` (64 bytes) for one profile, one key version and one recipient device.
+A wrap carries `NK_kv || DK_kv` (64 bytes) for one profile, one key version and one recipient device.
 
 Creation by device `from` for recipient device `to` (public key `ecdh_pub_to`), authorized by log entry at log seq `at` (section 9.5):
 
@@ -285,7 +285,7 @@ Creation by device `from` for recipient device `to` (public key `ecdh_pub_to`), 
 3. `KEK = HKDF(ikm = Z, salt = H(enc(eph_pub, ecdh_pub_to)), info = enc("ebs/v1/wrap", p, u32(kv), to, from), L = 32)` as AES-GCM-256.
 4. `nonce` = 12 random bytes.
 5. `aad = enc("ebs/v1/wrap-aad", p, u32(kv), to, from, u64(at), eph_pub)`.
-6. `ct = AES-GCM-Encrypt(KEK, nonce, NK || DK_kv, aad)` (80 bytes).
+6. `ct = AES-GCM-Encrypt(KEK, nonce, NK_kv || DK_kv, aad)` (80 bytes).
 7. `sig = ECDSA-Sign(sign_priv_from, enc("ebs/v1/wrap-sig", p, u32(kv), to, from, u64(at), eph_pub, nonce, ct))`.
 8. Discard `eph_priv`, `Z`, `KEK` and the plaintext buffer.
 
@@ -309,21 +309,21 @@ Wire format:
 Verification by the recipient (all steps MUST pass, else the wrap is rejected and the client shows a security warning):
 
 1. The client has a verified membership log for `p` up to at least log seq `at`.
-2. The entry at `at` is either an `add_device` entry adding `to` while the profile was at `kv`, or a `rotate_key` entry introducing `kv` (and `to` is active right after it), or a `genesis` entry with `kv = 1` that includes `to`.
+2. The entry at `at` is either an `add_device` entry adding `to` while the profile was at `kv`, or a `rotate_key` entry introducing `kv` (and `to` is active right after it), or a `genesis` entry with `kv = 1` that includes `to`, or a `rekey_device` entry by `to` itself (6.5; then `from == to`).
 3. `from` is the author of that entry.
 4. `sig` verifies under `from`'s `sign_pub` as recorded in the log.
 5. Decryption succeeds.
-6. `dk_commit(kv)` computed from the unwrapped DK equals the value in the log for `kv`, and `nk_commit` equals the genesis value.
+6. `dk_commit(kv)` and `nk_commit(kv)` computed from the unwrapped DK and NK equal the values in the log for `kv`.
 
 ### 5.4 History blob
 
 On rotation from `kv - 1` to `kv`, the rotating device stores:
 
 ```json
-{ "v": 1, "profile_id": "p_...", "kv": 4, "nonce": "<b64u 12>", "ct": "<b64u 48>" }
+{ "v": 1, "profile_id": "p_...", "kv": 4, "nonce": "<b64u 12>", "ct": "<b64u 80>" }
 ```
 
-with `ct = AES-GCM-Encrypt(K_hist(kv), nonce, DK_(kv-1), enc("ebs/v1/hist-aad", p, u32(kv)))`. A client that needs `DK_j` for `j < kv` decrypts the chain downward and checks `dk_commit(j)` at each step. History blobs are not signed: only holders of `DK_kv` can create them, and the commitment check detects substitution.
+with `ct = AES-GCM-Encrypt(K_hist(kv), nonce, NK_(kv-1) || DK_(kv-1), enc("ebs/v1/hist-aad", p, u32(kv)))`. A client that needs `NK_j` and `DK_j` for `j < kv` decrypts the chain downward and checks `nk_commit(j)` and `dk_commit(j)` at each step. History blobs are not signed: only holders of `DK_kv` can create them, and the commitment check detects substitution.
 
 ### 5.5 Recovery key and recovery device
 
@@ -360,12 +360,12 @@ Secrets MUST only be handled by the service worker and by extension pages (optio
 
 | Item | Location | Notes |
 |------|----------|-------|
-| `sign_priv`, `ecdh_priv` | IndexedDB database `ebs-sync`, store `device`, as non-extractable `CryptoKey` objects | Generated with `extractable = false`. |
+| `sign_priv`, `ecdh_priv` | IndexedDB database `ebs-sync`, store `device`, as non-extractable `CryptoKey` objects | Generated with `extractable = false`. With the app lock on (6.5): stored only as PKCS#8 encrypted under `K_at_rest`, and held as non-extractable `CryptoKey`s in service worker memory while unlocked. The same applies to the token, the record cache and the outbox. |
 | `sign_pub`, `ecdh_pub` (raw) | same record | Public. |
 | `device_id`, device token | same record | Token as a string. |
 | Wrap blobs, history blobs | IndexedDB store `keys` | Useless without `ecdh_priv`. Cached so the extension works offline. |
 | Derived keys `K_rec(kv)`, `K_meta(kv)`, `K_rid` | IndexedDB store `keys`, non-extractable `CryptoKey` | A cache; can be re-derived from wraps. |
-| Raw `NK`, `DK_kv` bytes | Service worker memory only, transiently | Needed only when wrapping for another device or creating a history blob; zeroed (`fill(0)`) after use. Never persisted. |
+| Raw `NK_kv`, `DK_kv` bytes | Service worker memory only, transiently | Needed only when wrapping for another device or creating a history blob; zeroed (`fill(0)`) after use. Never persisted. |
 | Verified log state per profile | IndexedDB store `profiles` | Includes head, devices, roles, kv, commits. |
 | Plaintext record cache and outbox | IndexedDB stores `records`, `outbox` | Same at-rest exposure as today's local backend. |
 | OAuth `state`, PKCE `code_verifier` during connect | `chrome.storage.session` | Access level `TRUSTED_CONTEXTS` (already set by `src/background.js`). Deleted when the flow ends. |
@@ -388,7 +388,56 @@ sign = crypto.subtle.generateKey({name: "ECDSA", namedCurve: "P-256"}, false, ["
 ecdh_pub = exportKey("raw", ecdh.publicKey); sign_pub = exportKey("raw", sign.publicKey)
 ```
 
-Separate key pairs for agreement and signing are required by WebCrypto key usages and are good key separation practice. A device never rotates its key pairs in v1; a compromised device is removed and reconnected as a new device.
+Separate key pairs for agreement and signing are required by WebCrypto key usages and are good key separation practice. A device rotates its key pairs only when the app lock is switched on for a device that was connected without it (6.5); a compromised device is removed and reconnected as a new device.
+
+With the app lock on at connect time, the key pairs are generated with `extractable = true`, exported once as PKCS#8, encrypted under the app lock key (6.5), and re-imported as non-extractable keys for use; the exported bytes are zeroed.
+
+### 6.5 Optional app lock
+
+Off by default. In the options page, "App-vergrendeling" protects this device's sync secrets at rest with a PIN or passphrase, and locks after a period without activity.
+
+- Secret: a PIN of at least 6 digits, or a passphrase of at least 12 characters. The options page recommends a passphrase of four or more random words and says what a PIN does and does not protect against (below).
+- Idle timeout: 5, 15, 30 (default), 60 minutes or 4 hours without user activity. The browser restarting always locks.
+- Protected at rest: the device private keys, the device token, the plaintext record cache and the outbox of the `sync` backend, the Teamwerk settings, and the cached derived keys (with the lock on, derived keys are never written to disk). Wraps and history blobs need no extra protection; they are useless without the private keys.
+- Not covered: data of the `local` backend (including personal per-screen preferences), the `opmerking` backend (it lives in e-Boekhouden), and the existing session-switcher data of EB Sessions. The options page says so.
+
+Keys:
+
+```
+lock_salt  = 16 random bytes; iterations pinned to 600000 (as 5.5)
+S_lock     = PBKDF2-HMAC-SHA-256(utf8(NFC(secret)), lock_salt, 600000, 256 bits)
+K_lock     = HKDF(S_lock, Z32, enc("ebs/v1/applock-kek", device_id))               AES-GCM-256
+UK         = 32 random bytes (the unlock key)
+lock_blob  = { v: 1, salt: lock_salt, iterations: 600000, nonce,
+               ct: AES-GCM-Encrypt(K_lock, nonce, UK, enc("ebs/v1/applock-aad", device_id)) }
+K_at_rest  = HKDF(UK, Z32, enc("ebs/v1/applock-data", device_id))                   AES-GCM-256
+item_ct    = AES-GCM-Encrypt(K_at_rest, random nonce, item bytes, enc("ebs/v1/applock-item", store, item key))
+```
+
+`lock_blob` is stored in IndexedDB `meta`. Every protected item (PKCS#8 private keys, token, each cached record, each outbox entry) is stored as `item_ct`. The indirection through `UK` lets the user change the PIN by rewrapping 32 bytes.
+
+Unlocking and staying unlocked:
+
+1. The user enters the secret in the popup or the options page. The client runs PBKDF2 (well under a second on a desktop), decrypts `UK`, derives `K_at_rest`, decrypts the private keys and imports them as non-extractable `CryptoKey`s in service worker memory.
+2. The service worker stores `UK` (base64url) and `unlocked_until` in `chrome.storage.session`, which lives in memory only, is cleared when the browser quits, and is not readable by content scripts (`TRUSTED_CONTEXTS`). When the worker restarts after being idle, it re-derives `K_at_rest` from there without asking again.
+3. User activity (input events reported by content scripts at most once per minute, and any interaction with an extension page) moves `unlocked_until` forward. A one-shot `chrome.alarms` alarm fires at `unlocked_until` (subject to the alarm minimums of 10.13); on any service worker event the lock is also checked.
+4. Locking deletes `UK` from `chrome.storage.session`, drops all keys and decrypted data from memory, closes Teamwerk sockets and stops sync.
+5. Wrong secrets: after 5 failures the client waits 30 seconds before the next attempt, doubling up to 15 minutes. The counter is a usability measure only; an attacker with a copy of the disk is not slowed by it. After 20 failures the client offers "Apparaat ontkoppelen" (10.6).
+6. Forgotten secret: the device keys cannot be recovered. The user disconnects the device and connects it again as a new device (approval needed again), or uses the recovery kit (10.16). Unsynced writes in the outbox are lost; the options page warns about this when the lock is switched on.
+
+While locked: the service worker answers store calls of content scripts for `sync` namespaces with `{error: "locked"}` and does not queue writes; features show "EB Sessions is vergrendeld" with a button that opens the popup to unlock. The `local` backend keeps working. Sync, approvals and Teamwerk pause until unlock.
+
+Switching the lock on for a device connected without it (key rollover), because its existing keys are non-extractable and cannot be encrypted:
+
+1. The user sets the secret; the client creates `UK` and `lock_blob`.
+2. It generates new key pairs as described in 6.4 for the app lock case.
+3. `POST /v1/devices/self/keys {sign_pub, ecdh_pub, proof}` signed with the old key (11.2), where `proof = ECDSA-Sign(new sign_priv, enc("ebs/v1/rekey-proof", device_id, old device_jkt, new device_jkt))`. The server switches the device's request-signing key and `device_jkt` to the new keys.
+4. For each profile, sequentially: append `rekey_device {sign_pub, ecdh_pub}` (9.3), signed with the old key that the log still records, together with a wrap of the current `NK_kv || DK_kv` from this device to its own new ECDH key, `at` = the entry's seq. The server then deletes wraps addressed to the old key.
+5. When every profile is done, the client deletes the old `CryptoKey` objects, encrypts the token, cache and outbox under `K_at_rest`, and deletes the plaintext copies. IndexedDB may keep deleted bytes on disk until it compacts its files; the options page says that the lock fully protects data written after it was switched on.
+
+Members see the new device code in the members list with "Apparaatcode gewijzigd (app-vergrendeling ingeschakeld)" and can compare it again. Switching the lock off (after unlocking) stores the keys again as non-extractable `CryptoKey` objects, decrypts the cache and deletes `lock_blob`; no rollover is needed.
+
+What a PIN protects against: anyone using the browser while the extension is locked, and casual inspection of the disk. Against an attacker with a disk image, a 6-digit PIN costs about 10^6 times 600,000 PBKDF2 iterations to search exhaustively, which is hours to days on commodity hardware, not more. A passphrase of four or more random words resists offline guessing. This is stated in the options page and in 14.3 T6.
 
 ---
 
@@ -450,14 +499,16 @@ Features address data by logical key within the active profile. Keys are UTF-8 s
 | `hiddenLines` | `hiddenLines/8812345` | hide flag and reason for one bank line |
 | `ai` | `ai/8812345` | AI classification for one bank line |
 | `reminders` | `reminders/ladder` | reminder ladder mapping |
-| `prefs` | `prefs/screen/<screenId>` | per-screen preferences |
+| `prefs` | not synced | per-screen preferences: personal, always on the `local` backend (below) |
 | `meta` | reserved | never used as a record; profile meta is separate (8.7) |
 
 Features SHOULD store one record per item (one per bank line, one per group) rather than one large map, because last-write-wins works per record and small records conflict less.
 
+Per-screen preferences are personal. They are never written to a profile, so colleagues never see or overwrite each other's column widths, filters or layouts. They stay on the `local` backend of each device; the `sync` backend MUST refuse keys in the `prefs` namespace. Syncing them only between one user's own devices was considered and rejected for v1: it needs a per-user key shared by all of that user's devices, with its own wrapping, its own rotation when one of those devices is revoked and its own approval of new devices, which is a second key distribution system next to profiles, for data that is cheap to set again on a new device.
+
 ### 8.2 Record id
 
-`rid = rid(logical key)` as in section 5.2. Because `NK` is constant per profile, the id of a logical key never changes, including across rotations. The server sees a stable opaque id per logical key.
+`id = rid_kv(logical key)` as in section 5.2, where `kv` is the key version the record is encrypted under. Because NK rotates with DK, the id of a logical key changes at every rotation: the re-encryption pass (10.15) moves each record to its new id. Between rotations the id is stable. Clients therefore identify a record by its logical key `k` (inside the ciphertext), not by its id; the id is only the server-side address.
 
 ### 8.3 Plaintext payload and padding
 
@@ -475,7 +526,7 @@ The plaintext JSON payload is:
 
 | Field | Meaning |
 |-------|---------|
-| `k` | logical key. Readers MUST check `rid(k) == id` and reject the record otherwise. |
+| `k` | logical key. Readers MUST check `rid_kv(k) == id` for the envelope's `kv` and reject the record otherwise. |
 | `v` | the value, any JSON. `null` in a tombstone. |
 | `t` | hybrid clock timestamp of the write (8.6). |
 | `d` | device id of the writer. Used as LWW tie-breaker and for display ("laatst gewijzigd op apparaat X"). |
@@ -513,10 +564,11 @@ The server adds `change_seq`, `updated_at` (server time) and `updated_by` (devic
 
 ### 8.5 Versions and compare-and-set
 
-- `version` is a per-record counter. A new record is written with `base_version = 0` and `version = 1`.
-- Every upsert or delete writes `version = base_version + 1`. The server accepts the write only if the stored version equals `base_version` (0 means "does not exist"). Otherwise the item is a conflict and the server returns the current envelope.
+- `version` is a per-row counter at one key version. A new record is written with `base_version = 0` and `version = 1`.
+- Every upsert or delete writes `version = base_version + 1`. The server accepts the write only if the stored version at that id equals `base_version` (0 means "does not exist"). Otherwise the item is a conflict and the server returns the current envelope.
 - A tombstone keeps its version. Re-creating a deleted key is an upsert with `base_version` = tombstone version.
-- Rekey writes (section 10.15) keep `version` unchanged, change `kv` and ciphertext, and are accepted only if the stored `(version, kv)` equal the expected values.
+- The order of the states of one logical key is `(kv, version)`, compared lexicographically. Moving a record to a new key version (by the rename pass of 10.15 or by a write, below) restarts its version at 1 under its new id; `(kv_new, 1)` is newer than any `(kv_old, v)`. Restarting the version is deliberate: carrying the old version number to the new id would let the server link old and new ids.
+- A client that writes a logical key whose cached state is at an older `kv` (the rename pass has not reached it yet) writes it to `rid_current(k)` with `base_version = 0`, `version = 1` and `from = {id: old id, kv: old kv, version: cached version}`. The server accepts this only if no row exists at the new id and the row at `from.id` still has exactly that `kv` and version; it then deletes the old row and inserts the new one in one transaction. Otherwise it is a conflict: the server returns the row at the new id if there is one, else the row at `from.id`. Such a write links the record's old and new id for the server (14.4).
 - The server MUST reject upserts and deletes whose `kv` is not the profile's current `kv` (`409 stale_key_version`).
 
 ### 8.6 Hybrid clock and last-write-wins
@@ -533,12 +585,12 @@ A namespace MAY register a merge function `(local, remote) -> value` instead of 
 
 Rollback protection: the client persists, per record id, the highest version it has ever seen (also after the record was deleted locally), and per profile the highest verified log head, `current_kv` and `meta_version`. Each of the following is a rollback; the client then shows "Beveiligingswaarschuwing: de server toont oudere gegevens" naming the profile, stops pushing to that profile, keeps its local state, and resumes only when the server again presents state at least as new as the stored values (or after the user chooses "Opnieuw instellen", which discards the stored values for that profile):
 
-1. a record with a version lower than the highest seen for its id, or the same version with different plaintext (the client stores the SHA-256 of the padded plaintext for the highest version of each id);
+1. a record whose `(kv, version)` is lower than the highest seen for its logical key, or the same `(kv, version)` with different plaintext (the client stores, per logical key, the highest `(kv, version)` and the SHA-256 of its padded plaintext). A renamed record with identical plaintext at a higher `(kv, version)` is not a change: the client updates its stored id, `kv` and version silently, without notifying features;
 2. a log head with a lower seq than the verified head, or the same seq with a different hash;
 3. `current_kv` lower than the highest verified `kv`;
 4. a meta with `meta_version` lower than the highest seen.
 
-Stale writer check (detects a member who keeps writing with an old key, which happens only if the server withheld a rotation from that member or accepted writes with an old `kv`, see 14.3 T7): when a reader applies a record whose version is newer than any it has seen for that id and whose `kv` is lower than the reader's current `kv`, it looks up the `rotate_key` entry that introduced `kv + 1` (the first version after the record's). If the payload's `h.seq` is lower than that entry's seq and the payload's `t` is later than that entry's `ts` plus 10 minutes, the reader shows "Beveiligingswaarschuwing: <naam> schrijft nog met een oude sleutel" naming the writer device's user (from the log) and offers "Melden aan <naam>". The record is still applied. A rekey write never triggers this check, because it does not change the version.
+Stale writer check (detects a member who keeps writing with an old key, which happens only if the server withheld a rotation from that member or accepted writes with an old `kv`, see 14.3 T7): when a reader receives a record whose `kv` is lower than the reader's current `kv` and that is not identical to a state it has seen, it looks up the `rotate_key` entry that introduced `kv + 1` (the first version after the record's). If the payload's `h.seq` is lower than that entry's seq and the payload's `t` is later than that entry's `ts` plus 10 minutes, the reader shows "Beveiligingswaarschuwing: <naam> schrijft nog met een oude sleutel" naming the writer device's user (from the log) and offers "Melden aan <naam>". For such a record the `(kv, version)` rollback rule is skipped; its value is applied only if its `t` is newer than the cached value's `t`. The rename pass never triggers this check, because it writes at the current `kv` with unchanged plaintext.
 
 ### 8.7 Profile meta
 
@@ -615,26 +667,28 @@ Used in payloads:
 
 | type | payload | Meaning |
 |------|---------|---------|
-| `genesis` | `{ "owner": "u_...", "owner_name": EncName, "devices": [descriptor, ...], "kv": 1, "dk_commit": "...", "nk_commit": "...", "policy": { "approvers": "members", "auto_approve": false } }` | Creates the profile. `devices` contains the author and, if the owner has one, the owner's recovery device. |
+| `genesis` | `{ "owner": "u_...", "owner_name": EncName, "devices": [descriptor, ...], "kv": 1, "dk_commit": "...", "nk_commit": "<nk_commit(1)>", "policy": { "approvers": "members", "auto_approve": false } }` | Creates the profile. `devices` contains the author and, if the owner has one, the owner's recovery device. |
 | `add_device` | `{ "device": descriptor, "role": "member" or absent, "user_name": EncName (only with role), "via": "grant" or "self" or "auto" or "recovery", "verified": true or false }` | Adds a device. `role` is present when the device's user is not yet in the profile (a new member); it MUST be `member`, and `user_name` carries the display name the approver saw in the approval card, so that the name becomes member-attested. `verified` records whether the approving human ticked "Ik heb de code vergeleken". |
 | `remove_device` | `{ "device_id": "d_..." }` | Removes one device. |
 | `remove_user` | `{ "user_id": "u_..." }` | Removes a member and all their devices. Also completes a "leave" that the leaver started server-side. |
-| `rotate_key` | `{ "kv": n, "dk_commit": "...", "reason": "removal" or "owner" or "nonce_budget" }` | Introduces `DK_n`. `removal` follows removals in the same request; `owner` is a rotation the owner asked for; `nonce_budget` answers `rotation_recommended` (4.1). |
+| `rotate_key` | `{ "kv": n, "dk_commit": "...", "nk_commit": "...", "reason": "removal" or "owner" or "nonce_budget" }` | Introduces `NK_n` and `DK_n`. `removal` follows removals in the same request; `owner` is a rotation the owner asked for; `nonce_budget` answers `rotation_recommended` (4.1). |
 | `set_policy` | `{ "approvers": "members" or "owner", "auto_approve": true or false }` | Changes the profile policy. |
 | `transfer_owner` | `{ "user_id": "u_..." }` | Makes an existing member the owner; the previous owner becomes a member. |
 | `set_name` | `{ "user_id": "u_...", "name": EncName }` | Changes the display name of the author's own user in this profile. |
+| `rekey_device` | `{ "sign_pub": "<b64u 65>", "ecdh_pub": "<b64u 65>" }` | Replaces the author device's own key pairs (app lock rollover, 6.5). Signed with the old key. |
 
 Display names in the log are what the extension shows wherever a name must not be spoofable by the server or another member (approval results, members list, and all of Teamwerk, section 18). They are encrypted, so the log does not hand the server a second, permanent copy of every member's name (which would also survive account deletion in plaintext):
 
 ```
-K_name = HKDF(NK, Z32, enc("ebs/v1/name", p))                       AES-GCM-256
-EncName(user_id, name) = { "nonce": b64u(12 random bytes),
-                           "ct": b64u(AES-GCM-Encrypt(K_name, nonce, pad(utf8(NFC(name))),
-                                                      enc("ebs/v1/name-aad", p, user_id))) }
+K_name(kv) = HKDF(NK_kv, Z32, enc("ebs/v1/name", p))                AES-GCM-256
+EncName(user_id, name) = { "kv": kv,                                  the current key version
+                           "nonce": b64u(12 random bytes),
+                           "ct": b64u(AES-GCM-Encrypt(K_name(kv), nonce, pad(utf8(NFC(name))),
+                                                      enc("ebs/v1/name-aad", p, user_id, u32(kv)))) }
 pad(x) = u32(len(x)) || x || zero bytes, to a total of 128 bytes, or 512 if it does not fit
 ```
 
-A name is 1 to 100 code points and follows the display string rules of 3.6. `K_name` derives from NK so names stay readable across rotations. The approver encrypts the name it saw in the approval card (`user_name`); the user replaces it with their own `set_name` on their first sync after approval if it differs, and again whenever they rename themselves in the dashboard. A device without NK (pending) can verify every signature and the structure of `EncName` (base64url, 12-byte nonce, 144 or 528 bytes of ciphertext) but not the name itself. A name that fails to decrypt or to validate does not invalidate the log; it is shown as "Onbekende naam" with a security notice.
+A name is 1 to 100 code points and follows the display string rules of 3.6. `EncName.kv` MUST equal the profile's `kv` at the entry's position in the log; older names stay readable through the history chain, which carries the older NKs. After a removal, names in new entries are under a key the removed member does not have. The approver encrypts the name it saw in the approval card (`user_name`); the user replaces it with their own `set_name` on their first sync after approval if it differs, and again whenever they rename themselves in the dashboard. A device without NK (pending) can verify every signature and the structure of `EncName` (base64url, 12-byte nonce, 144 or 528 bytes of ciphertext) but not the name itself. A name that fails to decrypt or to validate does not invalidate the log; it is shown as "Onbekende naam" with a security notice.
 
 ### 9.4 State and validation
 
@@ -645,7 +699,7 @@ state = {
   owner: user_id,
   users: { user_id: { role: "owner" | "member", name: EncName } },
   devices: { device_id: { user_id, kind, sign_pub, ecdh_pub, added_seq, removed_seq | null, history: [[added_seq, removed_seq]] } },
-  kv: integer, dk_commit: { kv: string }, nk_commit: string,
+  kv: integer, dk_commit: { kv: string }, nk_commit: { kv: string },
   policy: { approvers, auto_approve },
   pending_rotation: bool,
   head: { seq, hash }
@@ -675,6 +729,7 @@ Entry `e` at log seq `s` is valid against `state` (the state after `s - 1`) if a
 | `set_policy` | `U` is the owner. |
 | `transfer_owner` | `U` is the owner; target is a member with at least one active device. |
 | `set_name` | `payload.user_id == U`; `name` structurally valid. |
+| `rekey_device` | `A` is a `browser` device; the new keys are well-formed and not used by any device in this log; afterwards `A`'s keys in `state` are the new ones (the old keys stay in `history` for verifying earlier entries and wraps). |
 
 Rationale for members being allowed to remove other members: server-side revocation (by an admin or the owner in the dashboard) is authoritative for access, and the server only accepts a member-authored removal when the server-side grant is already revoked (9.6). Allowing any member device to complete the cryptographic removal means rotation happens as soon as any member is online, instead of waiting for the owner (including removal of the owner's own lost device when the owner has no other device online; the owner's recovery device, if any, keeps the owner represented). A malicious member could only cause a denial of service, which the server-side check blocks anyway. Owner actions (`set_policy`, `transfer_owner`) wait until the owner has an active device again; the owner's new device can be approved by a member (the `add_device` rule for an existing user) or by the owner's recovery kit.
 
@@ -700,6 +755,7 @@ The server MUST, before accepting `POST /v1/profiles/{id}/log`:
 4. Check that the side data matches the entries exactly (else `422 log_invalid` with `details: {missing: [...], unexpected: [...]}`):
    - `genesis`: one wrap per genesis device with `kv = 1`, `at = 1`, `from` = author; a meta with `meta_kv = 1`, `meta_version = 1`.
    - each `add_device` at seq `s` for device `D`: exactly one wrap with `to = D`, `kv` = the current kv at `s`, `at = s`, `from` = the entry's author.
+   - each `rekey_device` at seq `s` by device `D`: exactly one wrap with `to = from = D`, the current kv, `at = s`; the server checks the entry signature against the key recorded for `D` in this profile (`profile_devices.sign_pub`), requires that the request comes from `D` and that `D`'s current server keys (after `POST /v1/devices/self/keys`) equal the entry's new keys; then it updates `profile_devices.sign_pub` and `ecdh_pub` and deletes wraps addressed to `D` under its old key.
    - each `rotate_key` at seq `s` introducing `n`: exactly one wrap with `kv = n`, `at = s`, `from` = the author for every device active after `s`; exactly one history blob with `kv = n`; a meta with `meta_kv = n` and `meta_version` = current plus 1.
    - nothing else: no wraps, history or meta that no entry calls for.
    The server SHOULD also verify each wrap's signature with the stored `sign_pub` of `from`. Clients verify wraps independently (5.3).
@@ -744,6 +800,8 @@ Every flow is written as numbered steps. "Client" means the extension service wo
 4. The invitee opens the link. The dashboard script reads the fragment, calls `POST /v1/auth/setup {token}`, and gets a session (`status` becomes `active`, `email_verified_at` is set because the link proves mailbox control).
 5. The dashboard asks the invitee to register a passkey and then shows "Verbind EB Sessions": open the extension and click "Verbinden".
 6. Optionally in the same dialog, the admin grants profiles (10.9). Grants for a user who has no device yet stay pending until the user connects a device and a member approves.
+
+Profile owners can also invite new accounts when sharing (10.9 step 1), unless an admin switched that off. Invited accounts whose set-up link was never used are deleted 30 days after the last invite (16.3); an owner or admin can resend the link before that.
 
 If `REGISTRATION = open`, anyone can create an account by requesting an email code for a new address (10.3, step E1 with `purpose = signup`). The account starts with no grants.
 
@@ -831,7 +889,7 @@ Release testing MUST cover passkeys and email codes inside the `launchWebAuthFlo
 Triggered by "Nieuw profiel" in the popup or navbar menu, or automatically per 7.4 rule 3.
 
 1. The client detects the administration number of the current tab (reported by the content script, 15.4) and asks the user to confirm "Profiel aanmaken voor administratie <nummer> (<naam>)?" when the creation is automatic for the first time.
-2. Generate `profile_id`, `NK`, `DK_1`.
+2. Generate `profile_id`, `NK_1`, `DK_1`.
 3. Include the user's recovery device if it is trusted (10.16, "Trusting and adding a recovery device automatically").
 4. Build the `genesis` entry: `owner = my user_id`, `owner_name = EncName(my user_id, my display name)` (9.3), devices = this device (plus the recovery device), `kv = 1`, `dk_commit(1)`, `nk_commit`, default policy. Sign it.
 5. Build wraps for every genesis device with `at = 1`.
@@ -852,7 +910,7 @@ Triggered by "Nieuw profiel" in the popup or navbar menu, or automatically per 7
 
 Grant creation:
 
-1. An admin in the dashboard ("Toegang", choose user and profile) calls `POST /v1/admin/grants {user_id, profile_id}`. Or the owner, in the extension ("Delen" in the profile menu) or the dashboard, calls `POST /v1/profiles/{id}/grants {email}`. If no account exists for that email: admins get an account created (10.2); owners get `404 user_not_found` unless the instance setting `OWNERS_CAN_INVITE = true`, in which case the server creates an invited account and sends the set-up link.
+1. An admin in the dashboard ("Toegang", choose user and profile) calls `POST /v1/admin/grants {user_id, profile_id}`. Or the owner, in the extension ("Delen" in the profile menu) or the dashboard, calls `POST /v1/profiles/{id}/grants {email}`. If no account exists for that email: admins get an account created (10.2); owners may invite a new account too, unless an admin has switched this off (instance setting `owners_can_invite`, on by default, in the dashboard under "Instellingen"): the server creates a user with `status = 'invited'` and `invited_by` = the owner, and sends an invite email with a set-up link (10.2 steps 2 to 5). The email names the owner and the profile label, and says that the account is only created when the link is used. Owner invites are rate limited (11.4). With the setting off, owners get `403 owner_invites_disabled` for unknown addresses and are told to ask their beheerder.
 2. The server creates `profile_members` with `role = 'member'`, `status = 'pending'`, `granted_by`, and `profile_devices` rows with `status = 'pending'` for each active device of the grantee. Devices the grantee connects later get rows too.
 3. The server records audit event `grant.created` and, if email notifications are on, emails the grantee ("Je hebt toegang gekregen tot <profiel>. Open EB Sessions en verbind het met <host>.") and the approvers ("<naam> wil toegang tot <profiel>. Open EB Sessions om dit toe te staan of te weigeren."). The emails contain no action links.
 
@@ -867,7 +925,7 @@ What the approver sees:
    1. Sync the log of the profile (fetch new entries, verify).
    2. Re-fetch the request and check that the device is still pending and that its public keys are those shown (the device code on screen must be the one computed from the keys that will be signed).
    3. For each pending device of that user in that profile (normally one), build an `add_device` entry: descriptor, `role: "member"` and `user_name = EncName(user_id, the name shown in the card)` (9.3) on the first entry if the user is new, `via: "grant"`, `verified` from the checkbox. Consecutive log seqs.
-   4. Unwrap this device's wrap for the current `kv` with `extractable` raw bytes (decrypt to `NK || DK`), wrap for each new device with `at` = its entry's seq, then zero the plaintext.
+   4. Unwrap this device's wrap for the current `kv` with `extractable` raw bytes (decrypt to `NK_kv || DK_kv`), wrap for each new device with `at` = its entry's seq, then zero the plaintext.
    5. `POST /v1/profiles/{id}/log {entries, wraps}`.
    6. On `409 log_conflict`, repeat from step 6.1 once. If the request is no longer pending (someone else approved), show "Al goedgekeurd door <naam>". A second conflict stops with an error.
 7. The server validates (9.6), stores, sets the grant `active` and the devices `active`, and records `grant.approved` with `verified`.
@@ -948,13 +1006,13 @@ Algorithm for one sync run:
 
 Debounce timers use `setTimeout` in the service worker. This is safe: every store message from a content script resets the worker's idle timer, a page navigation within e-Boekhouden sends a new screen-open message within seconds, and the outbox is persisted, so a worker that is stopped before a timer fires flushes the outbox when it next starts (`onStartup`, the next message, or the retry alarm).
 
-1. Acquire `navigator.locks.request("ebs-sync")` for the profile list step, then per profile `ebs-sync:<profile_id>`. If `navigator.onLine` is false, schedule a retry and stop.
+1. Acquire `navigator.locks.request("ebs-sync")` for the profile list step, then per profile `ebs-sync:<profile_id>`. If `navigator.onLine` is false, schedule a retry and stop. If the app lock (6.5) is on and the extension is locked, stop; sync resumes after unlocking.
 2. `GET /v1/profiles`. Update the local list. For profiles that disappeared or return `profile_deleted` or `access_revoked`: stop syncing them, keep the local copy, and show "Profiel <naam> is niet meer beschikbaar. Lokale kopie exporteren of verwijderen?".
 3. For each active profile, in order of use:
    1. If the server head differs from the local head: `GET /v1/profiles/{id}/log?after=<local head seq>`; verify (9.4); if verification fails, stop this profile with a security warning. If this device is no longer active in the log, delete keys and cached wraps for the profile and treat it as in step 2.
    2. If `current_kv` changed or a wrap is missing: `GET /v1/profiles/{id}/keys`; verify wrap and history (5.3, 5.4).
    3. Meta: step 2 of 10.8.
-   4. Pull: `GET /v1/profiles/{id}/records?since=<cursor>&limit=500` until `has_more` is false. For each envelope: decrypt, verify `rid(k) == id`, padding, version not lower than seen (8.6), log head gossip (9.7). If no local pending write exists for the id, apply it to the cache. If one exists and the remote version is not lower than its base, resolve with LWW now (8.6) and rebase the pending write. Store the new cursor after each page.
+   4. Pull: `GET /v1/profiles/{id}/records?since=<cursor>&limit=500` until `has_more` is false. For each envelope: decrypt (keys of the envelope's `kv`, through the history chain if older), verify `rid_kv(k) == id`, padding, `(kv, version)` order for the logical key (8.6), log head gossip (9.7). The cache is keyed by logical key; a renamed record with identical plaintext only updates the cached id, `kv` and version. If no local pending write exists for the key, apply it to the cache. If one exists and the remote state is not older than its base, resolve with LWW now (8.6) and rebase the pending write. Store the new cursor after each page.
    5. Writer check before pushing (the stale writer heuristic, see 8.6 and 14.3 T7). Do not push, and show "Beveiligingswaarschuwing: synchronisatie van <profiel> is gestopt omdat de ledenlijst niet bijgewerkt kan worden", if any of these happened in this run or since the last successful verification:
       - a record arrived with a `kv` higher than this device's current `kv`, or a profile summary reported a higher `current_kv`, and the log or keys up to it could not be fetched and verified;
       - a record payload or a Teamwerk `hello` or `st` frame (18.8) carried a log head with a higher seq than the verified head, and the log up to it could not be fetched and verified;
@@ -977,10 +1035,10 @@ Triggers: a member removes a device or user in the extension; a server-side revo
 Steps on the acting device:
 
 1. Sync the log (10.13 step 3.1).
-2. `kv_new = kv + 1`, `DK_new` = 32 random bytes.
-3. Entries: the removals (`remove_device` and/or `remove_user`), then `rotate_key {kv: kv_new, dk_commit: dk_commit(kv_new), reason: "removal"}`. Without a removal, only `rotate_key`: with `reason: "nonce_budget"` when the server reports `rotation_recommended` (any active device), or `reason: "owner"` when the owner chooses "Sleutel vernieuwen" (owner devices only).
-4. Wraps of `NK || DK_new` for every device that is active after the removals, including this device and recovery devices, all with `at` = the `rotate_key` seq.
-5. History blob `DK_old` under `K_hist(kv_new)` (5.4).
+2. `kv_new = kv + 1`, `NK_new` and `DK_new` = 32 random bytes each.
+3. Entries: the removals (`remove_device` and/or `remove_user`), then `rotate_key {kv: kv_new, dk_commit: dk_commit(kv_new), nk_commit: nk_commit(kv_new), reason: "removal"}`. Without a removal, only `rotate_key`: with `reason: "nonce_budget"` when the server reports `rotation_recommended` (any active device), or `reason: "owner"` when the owner chooses "Sleutel vernieuwen" (owner devices only).
+4. Wraps of `NK_new || DK_new` for every device that is active after the removals, including this device and recovery devices, all with `at` = the `rotate_key` seq.
+5. History blob `NK_old || DK_old` under `K_hist(kv_new)` (5.4).
 6. Meta re-encrypted under `K_meta(kv_new)` with `meta_version + 1`.
 7. `POST /v1/profiles/{id}/log {entries, wraps, history, meta}`.
 8. The server applies atomically: entries; wraps; history; meta; `profile_devices` of removed devices set to `removed`; all wraps addressed to removed devices deleted (every kv); grants of removed users set to `revoked`; `current_kv = kv_new`; `rekey_pending = true` if any record has `kv < kv_new`.
@@ -988,23 +1046,36 @@ Steps on the acting device:
 
 From step 8 on, the server rejects upserts with the old `kv` (`409 stale_key_version`); clients that get this error sync the log and keys and re-encrypt their pending writes.
 
-What rotation achieves and does not: the removed party cannot decrypt anything written after the rotation, even with a copy of the database. Everything it could read before (its local cache, old ciphertext it downloaded, `DK_old`) stays readable to it. Re-encryption (10.15) limits what a later database leak combined with `DK_old` exposes; it cannot take back what was already seen.
+What rotation achieves and does not: the removed party cannot decrypt anything written after the rotation, even with a copy of the database. Everything it could read before (its local cache, old ciphertext it downloaded, `DK_old`) stays readable to it. Re-encryption and renaming (10.15) limit what a later database leak combined with `DK_old` and `NK_old` exposes, and stop the removed party from recognizing records by their ids; they cannot take back what was already seen.
 
-### 10.15 Lazy re-encryption
+Right after a removal rotation succeeds, the acting device starts the rename pass (10.15) at once, ahead of its normal pushes, to keep the window short in which writes rename records one at a time (8.5).
 
-Goal: move records with `kv < current_kv` to `current_kv` without a request storm. Any active member device may do it.
+### 10.15 Lazy re-encryption and renaming
+
+Goal: move every record with `kv < current_kv` to `current_kv`, under the key version's new DK and its new id (NK rotated too), without a request storm and without telling the server which new id belongs to which old one. Any active member device may do it.
 
 1. Precondition: `rekey_pending` in the profile list.
 2. `POST /v1/profiles/{id}/rekey/lease {kv: current_kv}`. Answers: `200 {lease_id, expires_at, remaining}` (lease of 60 s, one holder per profile), `409 lease_held {expires_at}` (skip; another device is working), `204` (nothing left).
 3. The client keeps a pass cursor `after` (empty at the start of a pass, stored in IndexedDB with the `kv` it belongs to, so a pass can resume in the next sync run). Repeat at most 5 times per sync run:
-   1. `GET /v1/profiles/{id}/rekey/batch?lease_id=<..>&after=<cursor>&limit=200` returns up to 200 envelopes with `kv < current_kv` ordered by `(kv, id)` and strictly after the cursor, plus `next_after` (the cursor of the last returned row, or null at the end of the pass). The cursor makes progress even past records that cannot be rekeyed (they stay at the old `kv` and would otherwise be returned again forever).
-   2. For each envelope: obtain `DK_old` through the history chain, decrypt and verify as in pull, then encrypt the identical padded plaintext under `K_rec(current_kv)` with a new nonce and the same `version` and `deleted` (the AAD changes only in `kv`).
-   3. `POST /v1/profiles/{id}/records:put {lease_id, writes: [{op: "rekey", id, version, from_kv, kv, nonce, ct}]}`. The server applies each item only if the stored `(version, kv)` equals `(version, from_kv)`; otherwise the item result is `skipped` (a newer write at the current kv already replaced it). Rekey writes do not change `change_seq` or `updated_at`, so other devices do not re-download unchanged content. Each rekey batch renews the lease.
-   4. Wait at least 1 s before the next batch. On `429`, stop and continue at the next sync run.
-4. Records that fail to decrypt are skipped and counted. They keep old keys alive. The extension reports them to the owner ("<n> records konden niet worden omgezet") with the action "Verwijderen", which writes authenticated tombstones for them at the current `kv` (an upsert with `op: "delete"` and `base_version` = the stored version needs no decryption of the old content).
+   1. `GET /v1/profiles/{id}/rekey/batch?lease_id=<..>&after=<cursor>&limit=200` returns up to 200 envelopes with `kv < current_kv` ordered by `(kv, id)` and strictly after the cursor, plus `next_after` (the cursor of the last returned row, or null at the end of the pass). The cursor makes progress even past records that cannot be renamed.
+   2. For each envelope (live records and tombstones alike):
+      1. Obtain `NK_old` and `DK_old` of the envelope's `kv` through the history chain; decrypt and verify as in pull, including `rid_old(k) == id`.
+      2. Compute `new_id = rid_current(k)` with `K_rid(current_kv)`.
+      3. Re-encrypt the identical padded plaintext (same `k`, `v`, `t`, `d`, `h`) under `K_rec(current_kv)` with a new random nonce, `version = 1`, the same `deleted` flag, and the associated data of 8.4 for `(new_id, current_kv, 1, deleted)`.
+   3. Shuffle the new envelopes with a CSPRNG (Fisher-Yates), independently of the order of the old ids.
+   4. `POST /v1/profiles/{id}/records:rename {lease_id, deletes: [{id, kv, version}], inserts: [{id, kv, deleted, nonce, ct}]}` (11.11). The two lists are separate sets of equal length; nothing in the request pairs an old id with a new one. The server applies the batch atomically: either every delete and insert, or nothing. Inserted rows get `version = 1` and fresh `change_seq` values in the order of `inserts`, so the server cannot link old and new rows by version or by change order. Each batch renews the lease.
+   5. On `409 rename_conflict`, the response lists old ids whose row changed (a concurrent write or rename) and new ids that already exist. The client drops those records from the batch (it knows the pairs), and retries the rest once. They are handled by the write that changed them, or in the next pass.
+   6. Wait at least 1 s before the next batch. On `429`, stop and continue at the next sync run.
+4. Records that fail to decrypt are skipped and counted. They keep old keys alive. The extension reports them to the owner ("<n> records konden niet worden omgezet") with the action "Verwijderen", which removes those rows with `records:rename` `drops` (owner devices only; no tombstone, because nobody can read the record and its logical key is unknown).
 5. When `next_after` is null, the client calls `POST /v1/profiles/{id}/rekey/complete {lease_id, kv}`. The server counts records with `kv < current_kv`. If the count is 0, it sets `rekey_pending = false`, deletes history blobs and wraps for versions below `current_kv`, releases the lease and answers `200 {remaining: 0, cleared: true}`. Otherwise it answers `200 {remaining: n, cleared: false}` and keeps the old keys; the client starts a new pass in a later sync run only if the count went down since the previous pass, so undecryptable records do not cause endless passes. Clients drop cached keys for deleted versions when they see `rekey_pending = false`.
 
-Properties: idempotent (compare-and-set on `(version, kv)`, same version number), resumable (progress is server state), single worker (lease), crash-safe (lease expiry), bounded load (at most 30 batches per minute per profile enforced by the server, 5 batches per sync run by the client).
+Effects on other devices: every renamed row has a new `change_seq`, so each device pulls the whole profile once after a rotation. The pull recognizes a renamed record by its logical key and identical plaintext and only updates the cached id, `kv` and version (8.6, 10.13); features are not notified. This one-time download per device and rotation is the cost of unlinkable renaming; rotations are rare (removals, nonce budget, owner request).
+
+Writes during the pass: a client that writes a record not yet renamed renames it with that write (`from`, 8.5). A record that is renamed by the pass and written concurrently ends in one of two clean states: the pass wins (the write gets a conflict with the renamed row and is rebased by LWW) or the write wins (the pass gets `rename_conflict` for that row and drops it).
+
+Linkability: within one batch the server sees up to 200 deleted ids and 200 inserted ids. It can link a pair only through side channels: the padded size bucket (8.3), and changes after the rename (a record edited right after its old id disappeared). Writes that rename a single record (`from`) link that pair explicitly. These residuals are listed in 14.4 and 14.5.
+
+Properties: atomic per batch, idempotent (a repeated batch fails as a whole on its already-applied deletes and inserts and is then dropped), resumable (progress is server state plus the client's `after` cursor), single worker (lease), crash-safe (lease expiry), bounded load (at most 30 batches per minute per profile enforced by the server, 5 batches per sync run by the client).
 
 ### 10.16 Recovery kit
 
@@ -1121,6 +1192,7 @@ Error body:
 | 403 | `csrf` | CSRF header or Origin missing or wrong |
 | 403 | `device_not_active` | device is pending or revoked in this profile |
 | 403 | `registration_closed` | sign-up not allowed |
+| 403 | `owner_invites_disabled` | an owner shared with an unknown address while an admin has switched owner invites off |
 | 404 | `not_found` | unknown resource, or resource the caller may not know about |
 | 404 | `user_not_found` | grant by email for unknown user and owners may not invite |
 | 409 | `version_conflict` | at least one record write failed compare-and-set (details per item) |
@@ -1129,6 +1201,7 @@ Error body:
 | 409 | `lease_held` | another device holds the rekey lease |
 | 409 | `owned_profiles_shared` | account deletion blocked; details list the profiles |
 | 409 | `already_exists` | duplicate `profile_id` or similar |
+| 409 | `rename_conflict` | a rename batch whose rows changed; nothing was applied (11.11) |
 | 409 | `replayed` | `EBS-Nonce` already used on a non-idempotent endpoint (11.2) |
 | 410 | `profile_deleted` | profile is soft-deleted |
 | 413 | `too_large` | body, record or batch over the cap |
@@ -1160,6 +1233,7 @@ Rate limits are enforced with the Workers Rate Limiting binding (approximate, pe
 | Log appends per device | 10 per minute |
 | Export per user | 5 per day |
 | Admin endpoints per session | 120 per minute |
+| New-account invites by an owner | 10 per owner per day, 3 per email address per day, 100 per instance per day (D1 counters) |
 | Teamwerk tickets per device | 10 per minute |
 | Teamwerk frames per connection | 20 per second, burst 30 (18.11) |
 
@@ -1172,6 +1246,7 @@ Size caps:
 | Request body, other endpoints | 256 KiB |
 | Record `ct` | 65,552 bytes decoded (64 KiB bucket plus tag) |
 | Writes per `records:put` | 200 |
+| Pairs per `records:rename` | 200 |
 | Ids per `records:get` | 500 |
 | Records per pull page | 500 or 4 MiB of response, whichever comes first |
 | Log entries per append | 50 |
@@ -1316,6 +1391,7 @@ type Passkey = { id: string, name: string, created_at: number, last_used_at: num
 | `GET /v1/devices/self` | device | | `200 { device: Device }` |
 | `PATCH /v1/devices/{id}` | session or device (own) | `{ name: string }` | `200 { device: Device }` |
 | `DELETE /v1/devices/{id}` | session+reauth (own, or admin) | | `204` (revokes, 10.6) |
+| `POST /v1/devices/self/keys` | device (signed with the current key) | `{ sign_pub: B64<65>, ecdh_pub: B64<65>, proof: B64<64> }` | `200 { device: Device }`; the request-signing key and `device_jkt` switch to the new keys (6.5) |
 | `POST /v1/devices/recovery` | device | `{ sign_pub: B64<65>, ecdh_pub: B64<65> }` | `201 { device: Device }` |
 
 ```ts
@@ -1324,7 +1400,8 @@ type Device = {
   name: string, platform: string, sign_pub: B64<65>, ecdh_pub: B64<65>,
   created_at: number, last_seen_at: number | null,
   token_created_at: number | null, token_last_used_at: number | null,
-  revoked_at: number | null
+  revoked_at: number | null,
+  keys_rotated_at: number | null
 }
 type RecoveryKit = {
   sign_pub: B64<65>, ecdh_pub: B64<65>,          // public keys of the recovery device (5.5)
@@ -1368,7 +1445,8 @@ type ProfileSummary = {
 | `DELETE /v1/profiles/{id}` | owner (device, or session+reauth), admin (session+reauth) | | `202 { purge_at: number }` |
 | `POST /v1/profiles/{id}/restore` | owner or admin | `{}` | `200 { profile }` |
 | `GET /v1/profiles/{id}/members` | member or admin | | `200 { members: Member[] }` |
-| `POST /v1/profiles/{id}/grants` | owner | `{ email: string }` | `201 { member: Member }` |
+| `POST /v1/profiles/{id}/grants` | owner | `{ email: string, name?: string }` (`name` is used only when a new account is invited) | `201 { member: Member, invited: boolean }`; `403 owner_invites_disabled`; `429 rate_limited` |
+| `POST /v1/profiles/{id}/grants/{user_id}/resend` | owner | `{}` | `202` (new set-up link for an invited, not yet active user; counts toward the invite limits) |
 | `DELETE /v1/profiles/{id}/grants/{user_id}` | owner, admin, or the user themselves (leave) | | `202` (grant `revoked`, devices `revoking`) |
 | `GET /v1/approvals` | device | | `200 { requests: ApprovalRequest[] }` |
 | `POST /v1/approvals/deny` | device (approver-eligible) | `{ profile_id, user_id, reason: "denied" \| "code_mismatch" }` | `204` |
@@ -1442,7 +1520,7 @@ Configuration (Worker vars and secrets):
 | `ADMIN_EMAILS` | var | required | admins |
 | `ALLOWED_EXTENSION_IDS` | var | Web Store id of EB Sessions | OAuth client allow-list |
 | `REGISTRATION` | var | `closed` | self sign-up |
-| `OWNERS_CAN_INVITE` | var | `false` | owners may create accounts by sharing |
+
 | `EMAIL_LOGIN` | var | `true` | allow email login codes at all |
 | `EMAIL_NOTIFICATIONS` | var | `true` | grant and approval emails |
 | `SESSION_CSRF_KEY` | secret | required | HMAC key for the consent form `csrf` field |
@@ -1477,22 +1555,17 @@ Auth: device, active. Request `{ ids: B64<32>[] }` (max 500). Response `200 { re
 
 #### `POST /v1/profiles/{id}/records:put`
 
-Auth: device, active. This endpoint also performs deletes (op `delete`, carrying an encrypted tombstone) and rekeys.
+Auth: device, active. This endpoint also performs deletes (op `delete`, carrying an encrypted tombstone).
 
 ```ts
 // request
-{ lease_id?: string,                 // required when any op is "rekey"
-  writes: Array<
-    | { op: "upsert" | "delete", id: B64<32>, base_version: number, version: number,
-        kv: number, nonce: B64<12>, ct: string }
-    | { op: "rekey", id: B64<32>, version: number, from_kv: number,
-        kv: number, nonce: B64<12>, ct: string }
-  > }
+{ writes: Array<{ op: "upsert" | "delete", id: B64<32>, base_version: number, version: number,
+                  kv: number, nonce: B64<12>, ct: string,
+                  from?: { id: B64<32>, kv: number, version: number } }> }   // rename by write, 8.5
 
-// response: 200 if every item is ok or skipped, 409 version_conflict if at least one conflict
+// response: 200 if every item is ok, 409 version_conflict if at least one conflict
 { results: Array<
     | { id, status: "ok", version: number, change_seq: number }
-    | { id, status: "skipped" }                          // rekey whose precondition no longer holds
     | { id, status: "conflict", current: StoredEnvelope | null }
   >,
   cursor_hint: string }
@@ -1500,13 +1573,38 @@ Auth: device, active. This endpoint also performs deletes (op `delete`, carrying
 
 Server rules per item:
 
-1. `upsert` and `delete`: `version == base_version + 1`, `kv == current_kv` (else the whole request fails with `409 stale_key_version`), `deleted` is `op == "delete"`, `ct` within the cap. Compare-and-set on `base_version`.
-2. `rekey`: `kv == current_kv`, `from_kv < current_kv`, valid lease. Compare-and-set on `(version, from_kv)`. Does not change `change_seq` or `updated_at`.
+1. `version == base_version + 1`, `kv == current_kv` (else the whole request fails with `409 stale_key_version`), `deleted` is `op == "delete"`, `ct` within the cap. Compare-and-set on `base_version` at `id`.
+2. With `from`: `base_version` MUST be 0 and `version` 1. If a row exists at `id`, the item is a conflict with that row. Otherwise the row at `from.id` must have exactly `from.kv` (lower than `current_kv`) and `from.version`; the server deletes it and inserts the new row in the same transaction. Otherwise the item is a conflict with the row at `from.id` (or `null` if none exists).
 3. Items are independent (non-atomic batch). Accepted items get strictly increasing `change_seq` values in request order; gaps are allowed.
 4. Duplicate `id` in one request: `400 invalid_request`.
 5. Quotas: if the batch would exceed the live record or byte quota, the whole request fails with `422 quota_exceeded` before any write.
 
 `cursor_hint` lets the writer advance its own cursor past its own writes when nothing else changed in between (it equals the cursor before the request if no foreign writes intervened, else it is omitted). Clients MAY ignore it.
+
+#### `POST /v1/profiles/{id}/records:rename`
+
+Auth: device, active, holder of the rekey lease. Used only by the rename pass (10.15).
+
+```ts
+// request
+{ lease_id: string,
+  deletes: Array<{ id: B64<32>, kv: number, version: number }>,     // old rows
+  inserts: Array<{ id: B64<32>, kv: number, deleted: boolean, nonce: B64<12>, ct: string }>,  // new rows, shuffled
+  drops?:  Array<{ id: B64<32>, kv: number, version: number }> }    // undecryptable rows, owner devices only
+
+// response 200
+{ applied: number, cursor_hint?: string }
+// response 409 rename_conflict (nothing applied)
+{ error: { code: "rename_conflict", details: { stale_deletes: B64<32>[], existing_inserts: B64<32>[] } } }
+```
+
+Rules, applied atomically in one D1 batch:
+
+1. Valid lease; `len(deletes) == len(inserts)`, at most 200 each; no id twice in the request.
+2. Every delete and drop row exists with exactly that `kv` and `version`, and `kv < current_kv`.
+3. Every insert has `kv == current_kv` and an id with no existing row.
+4. Deleted and dropped rows are removed. Inserted rows get `version = 1`, `updated_by` = the caller, `updated_at` = now, and strictly increasing `change_seq` values in the order of `inserts`.
+5. Record and byte counts are adjusted. `writes_at_kv` counts each insert.
 
 ### 11.12 Rekey
 
@@ -1559,6 +1657,8 @@ All admin endpoints require session with `is_admin`; mutations require session+r
 | `GET /v1/admin/profiles?cursor=&owner=` | | `200 { profiles: Array<{ id, label, owner, member_count, pending_count, record_count, byte_count, current_kv, auto_approve, created_at, deleted_at }>, cursor }` |
 | `POST /v1/admin/grants` | `{ user_id, profile_id }` | `201 { member: Member }` (status `pending`) |
 | `DELETE /v1/admin/grants/{profile_id}/{user_id}` | | `202` |
+| `GET /v1/admin/settings` | | `200 { owners_can_invite: boolean }` |
+| `PATCH /v1/admin/settings` | `{ owners_can_invite?: boolean }` | `200 { owners_can_invite: boolean }` |
 
 `is_admin` cannot be set through the API for addresses outside `ADMIN_EMAILS`; admin status follows the configuration so that a compromised admin session cannot mint new admins. Disabling a user revokes their sessions and devices (devices become `revoking` in their profiles).
 
@@ -1573,7 +1673,8 @@ The dashboard is a static app using only the endpoints above. Pages:
 | Apparaten en tokens | user (admin: any user) | devices with device code, platform, created, last seen, token created and last used, revoke |
 | Profielen | user (admin: all) | profiles with label, owner, role, member count, record count, key version, auto-approve flag, pending approvals; rename (owner), delete and restore (owner, admin) |
 | Leden | owner, members, admin | members and their devices with status (`wacht op goedkeuring`, `actief`, `geweigerd`, `ingetrokken`), role, granted by, `verified`; grant access (owner, admin), revoke (owner, admin), leave (self) |
-| Gebruikers | admin | create accounts (email invite or set-up link), disable, resend set-up, delete |
+| Gebruikers | admin | create accounts (email invite or set-up link), disable, resend set-up, delete; shows who invited each account |
+| Instellingen | admin | instance settings: "Eigenaren mogen nieuwe accounts uitnodigen" (`owners_can_invite`, on by default) |
 | Auditlog | user (own), owner and members (profile), admin (instance) | events from 13.2, filterable by scope and action |
 | Koppelen | user | pairing code entry (10.5) |
 | Toestemming | user | OAuth consent page (10.4 step 9) |
@@ -1632,8 +1733,25 @@ CREATE TABLE users (
   email_verified_at INTEGER,
   created_at        INTEGER NOT NULL,
   last_login_at     INTEGER,
-  inactivity_warned_at INTEGER
+  inactivity_warned_at INTEGER,
+  invited_by        TEXT REFERENCES users(id) ON DELETE SET NULL,  -- admin or profile owner who invited
+  invited_at        INTEGER
 ) STRICT;
+
+CREATE TABLE instance_settings (
+  key         TEXT PRIMARY KEY CHECK (key IN ('owners_can_invite')),
+  value       TEXT NOT NULL,                    -- JSON
+  updated_by  TEXT REFERENCES users(id) ON DELETE SET NULL,
+  updated_at  INTEGER NOT NULL
+) STRICT;
+-- Missing rows mean the default: owners_can_invite = true.
+
+CREATE TABLE invite_counters (
+  scope       TEXT NOT NULL,                    -- "owner:<user_id>", "email:<sha256 of lower-cased address>", "instance"
+  day         INTEGER NOT NULL,                 -- Unix day number
+  count       INTEGER NOT NULL,
+  PRIMARY KEY (scope, day)
+) STRICT, WITHOUT ROWID;
 
 CREATE TABLE passkeys (
   id              TEXT PRIMARY KEY,             -- credential id, b64u
@@ -1744,7 +1862,8 @@ CREATE TABLE devices (
   prev_token_expires_at INTEGER,
   created_at            INTEGER NOT NULL,
   last_seen_at          INTEGER,
-  revoked_at            INTEGER
+  revoked_at            INTEGER,
+  keys_rotated_at       INTEGER                 -- app lock key rollover (6.5)
 ) STRICT;
 CREATE INDEX devices_user ON devices(user_id);
 CREATE INDEX devices_jkt ON devices(user_id, device_jkt);
@@ -1809,6 +1928,8 @@ CREATE TABLE profile_devices (
   profile_id   TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
   device_id    TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
   user_id      TEXT NOT NULL,
+  sign_pub     BLOB NOT NULL,                   -- keys as recorded for this device in this profile's log
+  ecdh_pub     BLOB NOT NULL,
   status       TEXT NOT NULL CHECK (status IN ('pending','active','revoking','removed','denied')),
   verified     INTEGER,                         -- from the add_device entry
   via          TEXT,                            -- grant | self | auto | recovery | genesis
@@ -1897,12 +2018,13 @@ Notes:
 
 - `records_changes` is unique so that `change_seq` is a total order per profile. Accepted writes in a batch take `profiles.change_seq + 1 ... + n`, updated in the same D1 batch. D1 batches run as one transaction and D1 serializes writes per database, so no two batches interleave.
 - Pull: `SELECT ... FROM records WHERE profile_id = ? AND change_seq > ? ORDER BY change_seq LIMIT ?`.
+- Rename: one D1 batch with a guard query (`SELECT count(*) ... WHERE (id, kv, version) IN (...)` must equal the number of deletes and drops, and no insert id may exist), the deletes, the inserts with consecutive `change_seq` values, and the counter updates. If the guard fails, the Worker aborts the batch and answers `409 rename_conflict`.
 - Rekey batch: `SELECT ... FROM records WHERE profile_id = ? AND kv < ? AND (kv, id) > (?, ?) ORDER BY kv, id LIMIT ?` (row-value comparison, served by `records_kv`); `next_after` is an opaque encoding of the last row's `(kv, id)`. The first page omits the row-value condition. The API (11.12) and the flow (10.15) use the same `(kv, id)` order.
 - `rotation_recommended` in API responses is computed as `writes_at_kv > 2^30` (4.1); every accepted `rotate_key` resets `writes_at_kv` to 0.
 - `profiles.approvers` and `auto_approve` mirror the last `set_policy` entry so the server can filter `/v1/approvals`; clients rely only on the log.
 - Rate limiting uses the Workers Rate Limiting binding; precise counters (email sends, code attempts) live in `email_logins`.
 - Teamwerk needs no D1 tables. The Worker declares a Durable Object binding `PRESENCE_ROOM` (class `PresenceRoom`, SQLite-backed) in `wrangler.toml`, with a migration entry for the new class. The object's own storage holds only used ticket nonces with their expiry (18.5), so single use survives hibernation; it never holds presence data.
-- Cron (daily): delete expired `webauthn_challenges`, `email_logins` (24 h after expiry), `setup_tokens`, `authorize_requests`, `oauth_codes`, `pairings`, `sessions`; delete expired `request_nonces`; hard-delete profiles past `purge_at`; delete audit events older than `AUDIT_DAYS`; delete revoked devices 90 days after `revoked_at` (rows that are still referenced by `profile_devices` with status `removed` keep only `id`, `user_id`, `kind`, public keys and `revoked_at`); inactivity warnings and deletions when enabled.
+- Cron (daily): delete expired `webauthn_challenges`, `email_logins` (24 h after expiry), `setup_tokens`, `authorize_requests`, `oauth_codes`, `pairings`, `sessions`; delete expired `request_nonces`; delete `invite_counters` older than 2 days; delete invited users whose last invite is older than 30 days and who never set up the account (with their grants); hard-delete profiles past `purge_at`; delete audit events older than `AUDIT_DAYS`; delete revoked devices 90 days after `revoked_at` (rows that are still referenced by `profile_devices` with status `removed` keep only `id`, `user_id`, `kind`, public keys and `revoked_at`); inactivity warnings and deletions when enabled.
 
 ---
 
@@ -1950,6 +2072,9 @@ Each event stores the fields of the `audit_events` table. `details` holds only t
 | `export.account`, `export.profile` | `{}` |
 | `account.created`, `account.disabled`, `account.deleted` | `{ by: "self" \| "admin" }` |
 | `admin.user_created` | `{ delivery }` |
+| `account.invited_by_owner` | `{ profile_id }` (actor: the owner; subject: the new user) |
+| `admin.settings_changed` | `{ owners_can_invite }` |
+| `device.keys_rotated` | `{ reason: "app_lock" }` |
 
 Record reads and writes are not audited individually (volume, and they would reveal activity patterns in more detail than needed). `profiles.change_seq` and `records.updated_by` already exist for sync.
 
@@ -2004,9 +2129,9 @@ When a user is deleted: events where they are actor or subject within their own 
 | Threat | Mitigation | Result |
 |--------|------------|--------|
 | Read record contents | AES-256-GCM under DK, which the server never has. | Prevented. |
-| Learn record names | Record ids are HMAC under NK. | Prevented (but see T7 and Q2). |
+| Learn record names | Record ids are HMAC under NK. | Prevented (see T7 for ex-members). |
 | Learn the administration of a profile | Administration number only inside encrypted meta (7.3). | Prevented. |
-| Forge or modify records | AEAD with associated data; `rid(k)` check. | Prevented. |
+| Forge or modify records | AEAD with associated data; `rid_kv(k)` check. | Prevented. |
 | Move records between profiles or ids, relabel versions or delete flags | All bound in the AAD (8.4). | Prevented. |
 | Roll back a record to an older version | Clients refuse versions lower than seen (8.6). | Detected for records the client saw; a device that never saw the newer version cannot tell. |
 | Withhold records or updates | Not preventable. | Residual (availability). |
@@ -2060,7 +2185,8 @@ TLS everywhere (HSTS on the dashboard; the client refuses `http:` except localho
 #### T6: stolen laptop
 
 - Unlocked Chrome session: the thief can use the extension as that device, including decrypted data, until the device is revoked. Mitigation: revoke from the dashboard on another device (passkey on a phone) or from another extension; the server cuts access immediately; the next eligible member rotates the key.
-- Locked laptop or disk image: Chrome profile files contain the IndexedDB with keys and cached plaintext unencrypted. Protection relies on OS disk encryption. Residual risk; see Q6 for an optional app lock.
+- Locked laptop or disk image: without the app lock, Chrome profile files contain the IndexedDB with keys and cached plaintext unencrypted, and protection relies on OS disk encryption. With the optional app lock (6.5), keys, token, cache and outbox are encrypted under a key derived from the PIN or passphrase; a thief with a locked browser cannot use them, and a thief with a disk image must guess the secret offline (hours to days for a 6-digit PIN, infeasible for a passphrase of four or more random words). Data of the `local` backend is not covered, and bytes written before the lock was switched on may survive on disk until IndexedDB compacts.
+- Unlocked extension: the idle timeout limits how long a walk-up attacker has; an unlocked session survives service worker restarts but not a browser restart.
 - The device token without the profile's IndexedDB is useless (T4).
 
 #### T7: malicious ex-member
@@ -2070,13 +2196,13 @@ TLS everywhere (HSTS on the dashboard; the client refuses `http:` except localho
 | Read new data after removal | Rotation; no wrap for removed devices; history chain only goes backward. | Prevented. |
 | Read old data | They had it. Lazy re-encryption limits exposure if they later obtain a database dump together with their old DK. | Residual (inherent). |
 | Continue to use the API | Server-side revocation is immediate; the device is removed in the log. | Prevented. |
-| Map record ids to names with server help | NK is not rotated in v1, so an ex-member colluding with the server can compute `rid` for names they can guess and watch which records change. | Residual, metadata only (Q2). |
+| Map record ids to names with server help | NK rotates with every key rotation, and the rename pass gives every record a new id in unpaired, shuffled batches with versions restarted at 1 and fresh change sequence numbers. An ex-member can compute old ids for names they can guess, but not the new ids. | Reduced. Residual: a server colluding with the ex-member can try to link old and new ids through the size bucket within a batch of up to 200, through edits right after a rename, and exactly for records that a write renamed (`from`, 8.5). Metadata only. |
 | Read records written between revocation and rotation | Only with server collusion; rotation happens at the next sync of any eligible member device. | Small residual window. |
 | Read new writes of a member whom the server keeps stale | A server colluding with the ex-member can withhold the rotation from one honest member (and accept that member's writes under the old `kv`, which an honest server refuses). The ex-member then reads those writes. Detection: readers' stale writer check (8.6), the writer's own checks before pushing (10.13 step 3.5), log heads in records and in Teamwerk `hello` and `st` frames (9.7, 18.8), and comparing the ledenlijstcode. | Not prevented. Detected quickly in profiles where members write or are online together; detection can take long in a quiet profile, until the 14-day notice or a manual code comparison. |
 
 #### T8: malicious current member
 
-Members are trusted with the data. A member can read everything, overwrite or delete records (LWW), approve others (unless `approvers = owner`), and remove other members' devices only after server-side revocation. Records carry the writer's device id inside the ciphertext and the server's `updated_by`, so abuse is attributable. Residual: data destruction by a member; mitigated by local copies on other devices and exports.
+Members are trusted with the data. An owner can additionally invite new accounts by email when sharing; abuse (invite spam from the instance's mail domain) is bounded by the invite limits of 11.4, audited (`account.invited_by_owner`), visible to admins in "Gebruikers", and can be switched off instance-wide. A member can read everything, overwrite or delete records (LWW), approve others (unless `approvers = owner`), and remove other members' devices only after server-side revocation. Records carry the writer's device id inside the ciphertext and the server's `updated_by`, so abuse is attributable. Residual: data destruction by a member; mitigated by local copies on other devices and exports.
 
 #### T9: XSS on the dashboard
 
@@ -2142,7 +2268,7 @@ When the owner enables `auto_approve`, any device the server lists as pending is
 | Devices | Name, platform, extension id, public keys, connection time, last seen (hour granularity), token age. |
 | Social graph | Which users share which profiles, roles, who granted and who approved, whether codes were compared (`verified`). |
 | Profiles | Count per user, label, member count, key version history (rotations imply removals), policy. |
-| Records | Count per profile; ciphertext size bucket (8.3); stable opaque id per logical key; version number per record (how often it changed); which device wrote it and when; tombstones and their time. |
+| Records | Count per profile; ciphertext size bucket (8.3); an opaque id per logical key that is stable between rotations and changes at each rotation (renames come in unpaired batches, except single renames by a write); version number per record (how often it changed); which device wrote it and when; tombstones and their time. |
 | Timing | When each device syncs. Sync on screen open reveals working hours and how often screens are opened (not which screen). Writes reveal editing activity bursts. |
 | Network | IP addresses at request time (Cloudflare and the Worker); only a prefix is stored in the audit log. |
 | Plaintext labels | Profile labels, device names, user display names and emails in the server's own tables (names inside membership logs are encrypted, 9.3). |
@@ -2159,8 +2285,8 @@ The server does not learn record contents, logical keys, administration numbers 
 2. Auto-approve profiles trust the server and admins completely.
 3. Forks between members who never write are not detected.
 4. Rollback to an older version is not detected by a device that never saw the newer one; withholding data is never preventable.
-5. Ex-members keep what they had; with server help they can map guessable names to record ids (NK not rotated).
-6. Plaintext caches and keys on disk are protected only by OS disk encryption.
+5. Ex-members keep what they had. With server help they can still link some old record ids to new ones after a rotation (size buckets within a rename batch, edits right after a rename, writes that renamed a record), and so keep following a few guessable records as metadata.
+6. Without the app lock, plaintext caches and keys on disk are protected only by OS disk encryption. With a PIN, a disk image can be brute-forced offline in hours to days; only a strong passphrase resists that.
 7. A hostile e-Boekhouden page can read whatever the extension shows in it and can write garbage into the active profile within validation limits.
 8. The operator learns the metadata in 14.4.
 9. Account-level attacks (mailbox takeover, phished passkey ceremonies, malicious admin) can cause denial of service and deletion (7-day restore window for profiles; none for account deletion by an admin, apart from D1 Time Travel).
@@ -2221,7 +2347,7 @@ interface Store {
 
 - Keys are logical keys (8.1), scoped implicitly by the current administration and, for the `sync` backend, the active profile.
 - Each namespace is configured with one backend:
-  - `local`: today's behaviour, `chrome.storage.local` (or IndexedDB) on this device only, keyed by administration.
+  - `local`: today's behaviour, `chrome.storage.local` (or IndexedDB) on this device only, keyed by administration. The `prefs` namespace is pinned to this backend (8.1).
   - `opmerking`: optional; writes tags into e-Boekhouden's own comment field of the object (for example a bank line). Visible to everyone with access to that administration in e-Boekhouden and to e-Boekhouden itself; not encrypted; subject to that field's length limits; useful for data that should live with the bookkeeping. The backend parses and writes a delimited tag block and leaves the rest of the comment untouched.
   - `sync`: this protocol. Reads from the local plaintext cache (IndexedDB `records`), writes to cache plus outbox, sync per 10.13. `list(prefix)` is answered from the cache by logical key, which is why logical keys are stored inside the ciphertext.
 - Switching a namespace's backend migrates data with an explicit user action ("Gegevens naar synchronisatie verplaatsen"), never silently.
@@ -2250,6 +2376,7 @@ interface Store {
 | Offline | Niet gesynchroniseerd (<n> wijzigingen wachten) |
 | Security warning | Beveiligingswaarschuwing: ... (log invalid, fork, rollback, wrap invalid) |
 | Default profile name | Mijn profiel |
+| App lock | App-vergrendeling, Ontgrendelen, EB Sessions is vergrendeld |
 | Recovery | Herstelsleutel maken, Herstellen met herstelsleutel |
 
 ### 15.6 Implementation checklist for the client
@@ -2259,7 +2386,7 @@ interface Store {
 3. Log verifier as a pure function `(state, entry) -> state | error`.
 4. Sync engine per 10.13 with Web Locks.
 5. Store backends and message API per 15.2 and 15.3.
-6. UI: options page (connect, devices, profiles, members, recovery, export), popup (status, switch, approvals), navbar menu (switch, sync, approval notice).
+6. UI: options page (connect, devices, profiles, members, recovery, export, app lock), popup (status, switch, approvals, unlock), navbar menu (switch, sync, approval notice, locked notice).
 7. Teamwerk module per 18 and 15.7: socket manager, frame codec, validator, overlay.
 
 ### 15.7 Teamwerk client notes
@@ -2289,6 +2416,7 @@ This section gives orientation for self-hosters and a future hosted instance. It
 | Data | Typical basis |
 |------|---------------|
 | Account email and name, passkeys, devices, grants | Art. 6(1)(b), performance of the contract (hosted), or Art. 6(1)(f), legitimate interest of the employer in providing work tools (self-hosted within an organization; mind the employment context). |
+| Email address and name of a person invited by an owner, before they set up the account | Art. 6(1)(f), the owner's interest in sharing a profile with that person. The invite email says who invited them and why; the data is deleted if the invite is not used within 30 days (16.3). |
 | Audit events with IP prefix and user agent family | Art. 6(1)(f), legitimate interest in security and abuse prevention (Recital 49). Data minimized: prefix only, family only. |
 | Session cookie | Strictly necessary for the service the user requested; exempt from consent under the ePrivacy rules (Dutch Telecommunicatiewet art. 11.7a). No analytics or tracking cookies are used, so no cookie banner is needed. |
 | Login and notification emails | Art. 6(1)(b) or (f), as for the account. |
@@ -2317,6 +2445,8 @@ This section gives orientation for self-hosters and a future hosted instance. It
 | Membership logs, wraps, history | lifetime of the profile; history and old wraps deleted after re-encryption completes |
 | Audit events | 365 days (configurable) |
 | Accounts | until deleted; optional automatic deletion after configurable inactivity with 30 days' warning |
+| Invited accounts never set up | deleted 30 days after the last invite email, with their grants |
+| Invite counters | 2 days |
 | D1 Time Travel (point-in-time restore) | up to 30 days, maintained by Cloudflare; deleted data disappears from it after that window. Documented in the privacy notice. |
 | Teamwerk presence | Not stored. Exists in transit and in Durable Object memory only for the duration of a connection; cleared when the socket closes. Not included in exports because nothing is held. |
 
@@ -2401,24 +2531,19 @@ A D1 leak exposes account metadata (emails, names, device names, IP prefixes in 
 
 ## 17. Open questions
 
-Only questions that need a decision by the product owner are listed. Engineering choices are made in the sections above.
+Only questions that need a decision by the product owner are listed. Engineering choices are made in the sections above. Decided by the owner and applied in this version: per-screen preferences are personal and local (8.1); any member may approve pending access (9.4, the owner can still restrict it to owners); owners may invite new accounts, which an admin can switch off (10.9); NK rotates on removal with renaming in the re-encryption pass (10.15); an optional app lock (6.5).
 
 | Id | Question | Current default in this spec |
 |----|----------|------------------------------|
-| Q1 | Should per-screen preferences be personal instead of shared within a profile? | Shared per profile. Alternative: a personal single-member profile per user and administration, or a `private/` namespace with a per-user key. |
-| Q2 | Rotate NK on member removal (give every record a new id) so that ex-members cannot map guessable names to ids with server help? | No: it rewrites every record id and tombstones the old ones on each removal. |
-| Q3 | Should the default profile label include the administration name for convenience, accepting that the server learns it? | No, `Mijn profiel`. |
-| Q4 | Default approver policy: any member, or the owner only? | Any member; the owner may restrict it. |
-| Q5 | May owners create accounts when sharing (`OWNERS_CAN_INVITE`)? | `false`. |
-| Q6 | An optional app lock (local cache and device keys protected by a passphrase or the WebAuthn PRF extension) against a stolen, locked laptop or a disk image? | Not in v1. |
-| Q7 | A flow for changing a user's email address while keeping `user_id`? | Not in v1; an admin recreates the account. |
-| Q8 | Faster approvals through Web Push or a Durable Object channel, instead of "at the next sync" plus an optional email? | Next sync plus optional email. |
-| Q9 | A hosted instance: DPA template, data location, abuse handling, pricing. | Out of scope for v1. |
-| Q10 | How the `opmerking` and `sync` backends interact for the same namespace (both writing, migration, conflicts). | One backend per namespace; explicit migration only. |
-| Q11 | When a sole owner of shared profiles deletes their account, transfer ownership automatically to the longest-standing member? | Block with `409` and require transfer or deletion. |
-| Q12 | A read-only member role? | Not in v1. |
-| Q13 | Encrypt the extension's plaintext export file, for example under a one-time passphrase? | Plaintext with a warning. |
-| Q14 | A continuous "volgen" mode in Teamwerk that keeps following a colleague's navigation? | One-shot "Volg" only. |
+| Q1 | Should the default profile label include the administration name for convenience, accepting that the server learns it? | No, `Mijn profiel`. |
+| Q2 | A flow for changing a user's email address while keeping `user_id`? | Not in v1; an admin recreates the account. |
+| Q3 | Faster approvals through Web Push or a Durable Object channel, instead of "at the next sync" plus an optional email? | Next sync plus optional email. |
+| Q4 | A hosted instance: DPA template, data location, abuse handling, pricing. | Out of scope for v1. |
+| Q5 | How the `opmerking` and `sync` backends interact for the same namespace (both writing, migration, conflicts). | One backend per namespace; explicit migration only. |
+| Q6 | When a sole owner of shared profiles deletes their account, transfer ownership automatically to the longest-standing member? | Block with `409` and require transfer or deletion. |
+| Q7 | A read-only member role? | Not in v1. |
+| Q8 | Encrypt the extension's plaintext export file, for example under a one-time passphrase? | Plaintext with a warning. |
+| Q9 | A continuous "volgen" mode in Teamwerk that keeps following a colleague's navigation? | One-shot "Volg" only. |
 
 ---
 
@@ -2522,13 +2647,13 @@ Why a ticket instead of the device token on the socket: browsers cannot set an `
 ```
 K_pres(kv)  = HKDF(DK_kv, Z32, enc("ebs/v1/presence", p, u32(kv)))      deriveBits(256), then imported as an HKDF base key
 K_sess      = HKDF(K_pres(kv), salt = sess, info = enc("ebs/v1/pres-sess", p, u32(kv), device_id))   AES-GCM-256
-K_focus     = HKDF(NK, Z32, enc("ebs/v1/focus", p))                      HMAC-SHA-256
+K_focus(kv) = HKDF(NK_kv, Z32, enc("ebs/v1/focus", p))                   HMAC-SHA-256
 ```
 
 - WebCrypto cannot `deriveKey` into an HKDF key (the target algorithm needs a length that HKDF keys do not have). `K_pres(kv)` is therefore computed with `deriveBits` (256 bits) and immediately imported with `importKey("raw", bits, "HKDF", false, ["deriveKey"])`; the bits buffer is zeroed afterwards. The same pattern applies to any HKDF-from-HKDF step.
 - `sess` is 16 random bytes, generated per socket connection by the sender. Each connection therefore encrypts under its own key, which makes a counter nonce safe: `nonce = u32(0) || u64(seq)`, with `seq` starting at 1 for each `sess` and incremented per frame. No nonce ever repeats under one key, regardless of how many frames all members send over the lifetime of `DK_kv` (random nonces would approach the 2^32 bound at 15 frames per second across many members and months).
 - Receivers derive the sender's `K_sess` from the `sess` in the frame header and cache it per `(device_id, sess)`.
-- `K_focus` derives row references (18.9). It uses `NK` because row references must match across key versions during a rotation; they are only ever sent inside encrypted frames.
+- `K_focus(kv)` derives row references (18.9) for the current key version. All members in a room share one `kv` (frames with another `kv` are not rendered, 18.15), so row references match; they change at each rotation and are only ever sent inside encrypted frames.
 
 ### 18.7 Frame format
 
@@ -2598,7 +2723,7 @@ Never sent, by construction: field values, amounts, typed text, text content of 
 Row keys are the logical identifiers of rows and records the extension already uses, for example `bankline/8812345` or `relatie/1234`. The content script sends row keys to the service worker, which turns them into row references:
 
 ```
-RowRef(rowkey) = "r_" + b64u(HMAC(K_focus, utf8(rowkey)))[0 .. 22]     (128 bits)
+RowRef(rowkey) = "r_" + b64u(HMAC(K_focus(kv), utf8(rowkey)))[0 .. 22]     (128 bits)
 ```
 
 The content script asks the worker for the refs of the rows it renders (`tw:rows`), so it can match incoming refs to local rows without holding `K_focus`.
@@ -2688,21 +2813,21 @@ Durable Objects bill per request and per unit of active duration; incoming WebSo
 
 ## 19. Summary of design choices
 
-- Unit of data and membership: the profile, bound to one administration and one owner, shareable, with its own DK (rotated) and NK (stable). Several profiles per administration are allowed; the extension switches per administration and remembers the choice per device.
+- Unit of data and membership: the profile, bound to one administration and one owner, shareable, with its own DK and NK, both rotated on every removal. Several profiles per administration are allowed; the extension switches per administration and remembers the choice per device.
 - Administration to profile mapping: the administration number lives only in encrypted profile meta; each client decrypts the metas of its profiles and builds a local index. A server-pepper HMAC was rejected (trivially reversible by the operator over a small number space), a per-user HMAC was rejected (extra key distribution, no help for shared profiles).
-- Crypto: P-256 ECDH and ECDSA, HKDF-SHA-256, AES-256-GCM, HMAC-SHA-256, PBKDF2-SHA-256 600,000 iterations for the recovery kit, all WebCrypto in Chrome 116. Device private keys are non-extractable and live in the extension origin's IndexedDB, never in `chrome.storage.local` or content scripts.
+- Crypto: P-256 ECDH and ECDSA, HKDF-SHA-256, AES-256-GCM, HMAC-SHA-256, PBKDF2-SHA-256 600,000 iterations for the recovery kit, all WebCrypto in Chrome 116. Device private keys are non-extractable and live in the extension origin's IndexedDB, never in `chrome.storage.local` or content scripts. An optional app lock (PIN or passphrase, PBKDF2, idle timeout, off by default) encrypts keys, token, cache and outbox at rest; switching it on for an existing device rolls its key pairs over with a signed `rekey_device` entry.
 - Records: random 96-bit nonce, AAD binds profile, record id, key version, record version and delete flag; padded to size buckets; HMAC record ids; last-write-wins with a hybrid clock (clamped against far-future clocks) and per-record compare-and-set versions. Tombstones are kept for the life of the profile, so cursors never expire and a client never deletes cached data on the server's word alone. Rollbacks of records, log, key version or meta raise a security warning and stop pushes.
 - Membership: signed, hash-chained log per profile, sent as exact canonical bytes and chained by a hash over the body only (ECDSA signatures are malleable). Simple validation rules, key commitments, encrypted display names, a cap of 150 active devices, rotations only after a removal, by the owner, or for the nonce budget. The server checks that wraps, history and meta match the entries exactly. Head gossip in records and in Teamwerk frames detects forks and members kept stale by a server that withholds a rotation; that last case is detected, not prevented.
-- Access: admins and owners grant server-side; grants stay pending until a member device approves with one click, showing a 100-bit device code that resists offline grinding, so approvals work asynchronously. Comparison is recorded as `verified`. Auto-approve exists per profile and is labelled as trusting the server.
+- Access: admins and owners grant server-side; grants stay pending until a member device approves with one click, showing a 100-bit device code that resists offline grinding, so approvals work asynchronously. Comparison is recorded as `verified`. Any member may approve (the owner can restrict this to owners). Owners may invite new accounts by email when sharing, rate limited and switchable off by an admin. Auto-approve exists per profile and is labelled as trusting the server. Per-screen preferences are personal and never leave the device.
 - Connection: OAuth 2.0 authorization code with PKCE through `chrome.identity.launchWebAuthFlow`, exact `chromiumapp.org` redirect validation against an extension id allow-list, 60-second single-use codes bound to the device keys; the consent form protected by `Origin`, `Sec-Fetch-Site` and a session-bound `csrf` field; the pairing code as automatic fallback when the auth window fails or is closed, and as a secondary option; opaque hashed device tokens rotated every 30 days and always combined with ECDSA request signatures that include a nonce (stored for the non-idempotent endpoints) over a normalised URL.
-- Revocation: immediate server-side cut-off, then removal plus rotation by any eligible remaining member; lazy, leased, idempotent re-encryption in `(kv, id)` order with an `after` cursor, batches of 200, server rate limits and an explicit completion call. Re-grants re-add removed devices with their original keys.
+- Revocation: immediate server-side cut-off, then removal plus rotation by any eligible remaining member; NK rotates with DK, and the lazy, leased re-encryption pass also renames every record to its new id in atomic, unpaired, shuffled batches of 200 with versions restarted at 1, in `(kv, id)` order with an `after` cursor, server rate limits and an explicit completion call. Each device pulls the profile once after a rotation. Re-grants re-add removed devices with their original keys.
 - Recovery: a per-user recovery pseudo-device whose private keys (with their public keys) are encrypted under a printed 128-bit key with PBKDF2 pinned at 600,000 iterations; it is attested by the creating device, added automatically to every profile of the user, and included in every rotation, so the kit never needs reprinting.
 - Dashboard: same-origin static app with passkeys first and email codes as fallback, strict CSP, no keys; sensitive actions need fresh user verification.
 - Logging: fixed-field operational logs with route templates; audit events without contents or secrets; IP prefixes only.
 - Teamwerk: one Durable Object room per profile with WebSocket hibernation, opened from the service worker only while an e-Boekhouden tab is visible, authenticated with a 60-second single-use ticket obtained through a signed request. Frames are encrypted under per-connection keys from a presence key derived from DK, signed per frame, protected against replay with per-session sequence numbers, padded to fixed sizes, relayed without storage, and attributed only through the signed membership log, which now carries display names. Route ids, anchor-relative cursors and HMAC row references are sent; field values, amounts and typed text never are. `hello` and `st` frames carry the sender's log head. Teamwerk is a plain extension setting, off by default; pause and visible room membership are mandatory.
 - GDPR: server export of all held data as NDJSON (ciphertext included), decrypted JSON export from the extension, defined retention and deletion semantics including D1 Time Travel.
 
-Open questions that most need an owner decision before implementation: Q1 (personal versus shared preferences), Q4 and Q5 (who may approve and who may invite), Q2 (NK rotation) and Q6 (app lock for stolen laptops).
+Remaining open questions (17) are product scope choices with working defaults; none blocks implementation. The ones most worth deciding early are Q1 (default profile label) and Q6 (sole owner account deletion).
 
 ---
 
@@ -2715,7 +2840,7 @@ Inputs:
 ```
 p      = "p_AAAAAAAAAAAAAAAAAAAAAA"
 DK_1   = 32 bytes of 0x01
-NK     = 32 bytes of 0x02
+NK_1   = 32 bytes of 0x02
 nonce  = 00 01 02 03 04 05 06 07 08 09 0a 0b
 ```
 
@@ -2731,9 +2856,9 @@ A.2 Profile keys and ids:
 ```
 K_rec(1)     = fc01b9493746d84c36c28fe66a2a4fa35f40c7f1f7054ccf7589c754c543500d
 dk_commit(1) = UhPsreJqDnLZNw09_nb4OnYE6uKg1R71gADqgRGWgnw
-K_rid        = 908edaf04024cb5f3aefbd1cd9e92225205c1038e58b5305144eef07d92d1a55
-rid("hiddenLines/8812345") = xXzeTbdADaKcinVB6pfXAC8JCKV59_PldBRVJhDlSkU
-nk_commit    = 1rTMOJp4kLEWwAiHfZhcMKPvziHyfuQKAPYKQfmF7Rw
+K_rid(1)     = 908edaf04024cb5f3aefbd1cd9e92225205c1038e58b5305144eef07d92d1a55
+rid_1("hiddenLines/8812345") = xXzeTbdADaKcinVB6pfXAC8JCKV59_PldBRVJhDlSkU
+nk_commit(1) = Gu18dcXzCoYB10Knx2KoTq_z3iqSDpHqH5xsxItL-iE
 ```
 
 A.3 Record encryption (version 1, not deleted, kv 1, the nonce above):
@@ -2756,7 +2881,7 @@ device_jkt  = sN-EQw4uFJKoATslDfCvN31HRW1xga-Gb-TaHIs5g5g
 device code = P3FR 8GRE 5RA9 5A01 7CJG
 ```
 
-A.5 Wrap (ephemeral private scalar = 32 bytes of 0x33, recipient = the ECDH key of A.4, `to = "d_BBBBBBBBBBBBBBBBBBBBBB"`, `from = "d_AAAAAAAAAAAAAAAAAAAAAA"`, `kv = 1`, `at = 1`, the nonce above, plaintext `NK || DK_1`):
+A.5 Wrap (ephemeral private scalar = 32 bytes of 0x33, recipient = the ECDH key of A.4, `to = "d_BBBBBBBBBBBBBBBBBBBBBB"`, `from = "d_AAAAAAAAAAAAAAAAAAAAAA"`, `kv = 1`, `at = 1`, the nonce above, plaintext `NK_1 || DK_1`):
 
 ```
 epk     = BFGnWAgziY6hsYPL1zUKQJkHjG7xweGOlwzXaDA18l59ARBSJxKwtafP8IFoVIaYSpTmgx7axG5zYPqdg0p6gaE
@@ -2792,21 +2917,47 @@ code_verifier  = AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8
 code_challenge = 6oZqdX5MOLq_qBJ8vppAnT4fk6AP8UiP9zX8-Rev_9A
 ```
 
-A.9 Teamwerk keys (same `p`, `DK_1`, `NK`; `sess` = 16 bytes of 0x44; `device_id = "d_AAAAAAAAAAAAAAAAAAAAAA"`). `K_pres(1)` is computed with `deriveBits` and re-imported as an HKDF key (18.6); `K_sess` is the `deriveBits` output of HKDF from that key, which equals the AES key `deriveKey` produces:
+A.9 Teamwerk keys (same `p`, `DK_1`, `NK_1`, `kv = 1`; `sess` = 16 bytes of 0x44; `device_id = "d_AAAAAAAAAAAAAAAAAAAAAA"`). `K_pres(1)` is computed with `deriveBits` and re-imported as an HKDF key (18.6); `K_sess` is the `deriveBits` output of HKDF from that key, which equals the AES key `deriveKey` produces:
 
 ```
 K_pres(1)                 = 530a8abca3230bd4994f98891051c7b5f4bb80723bfc78f311feca75efb90c8d
 K_sess                    = 8228dd84473586ec4025f1de2ee757d84f82ee5915a1e0054b5766ce58d4a3d7
-K_focus                   = 9bd323630f89855b7ec1e71f26d235c6cbf94f2713d17a361f13d1c93d6143da
+K_focus(1)                = 9bd323630f89855b7ec1e71f26d235c6cbf94f2713d17a361f13d1c93d6143da
 RowRef("bankline/8812345") = r_-b7zA2POPteaDsQQIYqPZ-
 nonce for seq 1           = 000000000000000000000001
 ```
 
-A.10 Encrypted display name (9.3; same `p` and `NK`; `user_id = "u_AAAAAAAAAAAAAAAAAAAAAA"`; name `"Dion de Vries"` (13 bytes, padded to 128); nonce = 00 01 ... 0b):
+A.10 Encrypted display name (9.3; same `p` and `NK_1`, `kv = 1`; `user_id = "u_AAAAAAAAAAAAAAAAAAAAAA"`; name `"Dion de Vries"` (13 bytes, padded to 128); nonce = 00 01 ... 0b; associated data `enc("ebs/v1/name-aad", p, user_id, u32(1))`):
 
 ```
-K_name = d11b40bdd349a52b78dd59997aa9fce39f8b4226d70b4d4f086571e8b0e4843c
+K_name(1)     = d11b40bdd349a52b78dd59997aa9fce39f8b4226d70b4d4f086571e8b0e4843c
+EncName.kv    = 1
 EncName.nonce = AAECAwQFBgcICQoL
-EncName.ct    = xEA-SOrHyIZSI3ITKf7S38vHQw_B_NoExbxldOXaaEW36hUJunWq3A-rBJD7Gp_m4uaVzLp-WQM5F2shVb4rafDJ3sEaSlNBuU_1QTL1IiopnpAe14jKVCnnuPcL5eKOtrcJrHtU6wkpiaEUQJdj67xgO-v5Y0DzAm5RniHAVikrHVW_8QEUUIGbz306TpJV
+EncName.ct    = xEA-SOrHyIZSI3ITKf7S38vHQw_B_NoExbxldOXaaEW36hUJunWq3A-rBJD7Gp_m4uaVzLp-WQM5F2shVb4rafDJ3sEaSlNBuU_1QTL1IiopnpAe14jKVCnnuPcL5eKOtrcJrHtU6wkpiaEUQJdj67xgO-v5Y0DzAm5RniHAVikdxM33LhLN9mpQ4vi8txge
 len(ct)       = 144
+```
+
+A.11 Rotation to `kv = 2` with renaming (10.14, 10.15). `NK_2` = 32 bytes of 0x03, `DK_2` = 32 bytes of 0x04. The record of A.3 (same padded plaintext) renamed by the pass: `version = 1`, not deleted, nonce = 00 01 ... 0b. The history blob for `kv = 2` carries `NK_1 || DK_1` with the same nonce:
+
+```
+nk_commit(2)                 = WaP0p4Yk1wB-8MXq-ivnCIp2ANLWmDRmijrdYFKbfpk
+dk_commit(2)                 = vF3syZc4j9xfP2841NKPda-7RJ6q469lkcbdEWC40dY
+K_rid(2)                     = 3cf68a5be098d30063c47b38eface0ce24b5854308cbef2c614bf1eb0243e0d1
+rid_2("hiddenLines/8812345") = bvvqEEpji4uHzRTHJS4agwBA_Q-WdMNul97IMNT_RnY
+K_rec(2)                     = 81f1d08d3ab870316092d265b1f58a8d10368160c8b8b81a446ab417b2998b85
+SHA-256(aad)                 = c74d24816dfb42e4a6d0b40905758eb2766e68a62d74b3faa1beed29952187aa
+len(ct)                      = 272
+SHA-256(ct)                  = 2b703b1df1e77368b80906e76469d15d4fc3c51fd238edb963048d52d9d9a6d0
+GCM tag                      = Kuemw64wK_Ku7cxc8e2IJA
+history ct (kv 2)            = 8mOPVvjQQg0hdjH6BvfAicAZ3bJo_Gufge-tJISMqM6pKcSiP5IJ_8uzPqTRbiG0PDF2wjQyVhRPkdK5BSmGLJufki3TTam5k_gXzTLx200
+len(history ct)              = 80
+```
+
+A.12 App lock (6.5). Secret `"123456"`, `lock_salt` = 16 bytes of 0xbb, 600,000 iterations, `device_id = "d_AAAAAAAAAAAAAAAAAAAAAA"`, `UK` = 32 bytes of 0x05, nonce = 00 01 ... 0b:
+
+```
+S_lock        = 4534b2ed7741139b1ca09b138a1f1c1a6b6b745bd270695e8bc1b3457a74d54c
+K_lock        = 68557c4de3fa3877152a75c7b28427a57447fd8bbeb0d7683be68d9cfb00224d
+lock_blob.ct  = hvatC_V_Ib2APWoD_RC3NOYSq1ouPey36EbnzzUzsU6YvagDcvrrHEceaRAuvBZr
+K_at_rest     = aa2f183c4f1c9ddc9e632f5539b64a82f82094fc5b0bcda79220e59f6861fa32
 ```
